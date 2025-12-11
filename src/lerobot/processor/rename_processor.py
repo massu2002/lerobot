@@ -64,6 +64,9 @@ class RenameObservationsProcessorStep(ObservationProcessorStep):
         new_features[PipelineFeatureType.OBSERVATION] = {
             self.rename_map.get(k, k): v for k, v in features[PipelineFeatureType.OBSERVATION].items()
         }
+        new_features[PipelineFeatureType.FUTURE_OBSERVATION] = {
+            self.rename_map.get(k, k): v for k, v in features[PipelineFeatureType.FUTURE_OBSERVATION].items()
+        }
         return new_features
 
 

@@ -47,7 +47,7 @@ pprint(repo_ids)
 # https://huggingface.co/datasets?other=LeRobot
 
 # Let's take this one for this example
-repo_id = "lerobot/aloha_mobile_cabinet"
+repo_id = "real_data/multi_task"
 # We can have a look and fetch its metadata to know more about it:
 ds_meta = LeRobotDatasetMetadata(repo_id)
 
@@ -135,7 +135,7 @@ print(f"{dataset[0]['action'].shape=}\n")  # (64, c)
 if __name__ == "__main__":
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=4,
+        num_workers=1,
         batch_size=32,
         shuffle=True,
     )

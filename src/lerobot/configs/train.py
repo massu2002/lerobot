@@ -67,6 +67,10 @@ class TrainPipelineConfig(HubMixin):
     checkpoint_path: Path | None = field(init=False, default=None)
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    
+    # 追加引数
+    use_dynamic_images: bool = False  # 動的領域マスクを使うかどうか
+    use_depth_maps: bool = False      # 深度マップを使うかどうか
 
     def validate(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.

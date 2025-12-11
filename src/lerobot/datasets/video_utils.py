@@ -391,87 +391,152 @@ def encode_video_frames(
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 
-def concatenate_video_files(
-    input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
-):
+# def concatenate_video_files(
+#     input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
+# ):
+#     """
+#     Concatenate multiple video files into a single video file using pyav.
+
+#     This function takes a list of video input file paths and concatenates them into a single
+#     output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
+#     concatenation without re-encoding.
+
+#     Args:
+#         input_video_paths: Ordered list of input video file paths to concatenate.
+#         output_video_path: Path to the output video file.
+#         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
+
+#     Note:
+#         - Creates a temporary directory for intermediate files that is cleaned up after use.
+#         - Uses ffmpeg's concat demuxer which requires all input videos to have the same
+#           codec, resolution, and frame rate for proper concatenation.
+#     """
+
+#     output_video_path = Path(output_video_path)
+
+#     if output_video_path.exists() and not overwrite:
+#         logging.warning(f"Video file already exists: {output_video_path}. Skipping concatenation.")
+#         return
+
+#     output_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+#     if len(input_video_paths) == 0:
+#         raise FileNotFoundError("No input video paths provided.")
+
+#     # Create a temporary .ffconcat file to list the input video paths
+#     with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
+#         tmp_concatenate_file.write("ffconcat version 1.0\n")
+#         for input_path in input_video_paths:
+#             tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
+#         tmp_concatenate_file.flush()
+#         tmp_concatenate_path = tmp_concatenate_file.name
+
+#     # Create input and output containers
+#     input_container = av.open(
+#         tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
+#     )  # safe = 0 allows absolute paths as well as relative paths
+
+#     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+#         tmp_output_video_path = tmp_named_file.name
+
+#     output_container = av.open(
+#         tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+#     )  # faststart is to move the metadata to the beginning of the file to speed up loading
+
+#     # Replicate input streams in output container
+#     stream_map = {}
+#     for input_stream in input_container.streams:
+#         if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
+#             stream_map[input_stream.index] = output_container.add_stream_from_template(
+#                 template=input_stream, opaque=True
+#             )
+
+#             # set the time base to the input stream time base (missing in the codec context)
+#             stream_map[input_stream.index].time_base = input_stream.time_base
+
+#     # Demux + remux packets (no re-encode)
+#     for packet in input_container.demux():
+#         # Skip packets from un-mapped streams
+#         if packet.stream.index not in stream_map:
+#             continue
+
+#         # Skip demux flushing packets
+#         if packet.dts is None:
+#             continue
+
+#         output_stream = stream_map[packet.stream.index]
+#         packet.stream = output_stream
+#         output_container.mux(packet)
+
+#     input_container.close()
+#     output_container.close()
+#     shutil.move(tmp_output_video_path, output_video_path)
+#     Path(tmp_concatenate_path).unlink()
+
+import os
+def concatenate_video_files(input_files, output_path, *, fps=30, crf=20, preset="veryfast"):
     """
-    Concatenate multiple video files into a single video file using pyav.
-
-    This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
-
-    Args:
-        input_video_paths: Ordered list of input video file paths to concatenate.
-        output_video_path: Path to the output video file.
-        overwrite: Whether to overwrite the output video file if it already exists. Default is True.
-
-    Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+    - 入力ファイル存在チェック
+    - 出力親ディレクトリの自動作成
+    - 出力と同じディレクトリ内に delete=False の一時ファイルを作って書き、
+      正常終了後にアトミックリネーム
+    - 再エンコードで単調な PTS/DTS を生成
     """
+    input_files = [str(p) for p in input_files]
+    output_path = Path(output_path)
 
-    output_video_path = Path(output_video_path)
+    # 1) 入力の存在確認（無ければ明示的に落とす）
+    missing = [p for p in input_files if not Path(p).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing input files: {missing}")
 
-    if output_video_path.exists() and not overwrite:
-        logging.warning(f"Video file already exists: {output_video_path}. Skipping concatenation.")
-        return
+    # 2) 出力の親ディレクトリを用意
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    # 3) 出力と同じ場所に安全な一時ファイルを作成（delete=False）
+    fd, tmp_path = tempfile.mkstemp(prefix=output_path.stem + "_", suffix=".mp4", dir=str(output_path.parent))
+    os.close(fd)  # ここでFDを閉じる（av.open はパスを開く）
+    tmp_path = Path(tmp_path)
 
-    if len(input_video_paths) == 0:
-        raise FileNotFoundError("No input video paths provided.")
+    try:
+        # 4) 1本目からフレームサイズ取得
+        with av.open(input_files[0]) as first_ic:
+            in_stream = first_ic.streams.video[0]
+            width  = in_stream.codec_context.width
+            height = in_stream.codec_context.height
 
-    # Create a temporary .ffconcat file to list the input video paths
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
-        tmp_concatenate_file.write("ffconcat version 1.0\n")
-        for input_path in input_video_paths:
-            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
-        tmp_concatenate_file.flush()
-        tmp_concatenate_path = tmp_concatenate_file.name
+        # 5) 出力を開く（コンテナ & ストリーム）
+        out = av.open(str(tmp_path), mode="w")
+        out_v = out.add_stream("libx264", rate=fps)
+        out_v.width   = width
+        out_v.height  = height
+        out_v.pix_fmt = "yuv420p"
+        out_v.options = {"preset": preset, "crf": str(crf)}
 
-    # Create input and output containers
-    input_container = av.open(
-        tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
+        # 6) 連結: 各入力をデコード → 出力ストリームでencode → コンテナへmux
+        for path in input_files:
+            with av.open(path) as ic:
+                iv = ic.streams.video[0]
+                for frame in ic.decode(iv):
+                    frame.pts = None  # 既存PTSは無視して再生成
+                    for packet in out_v.encode(frame):
+                        out.mux(packet)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
-        tmp_output_video_path = tmp_named_file.name
+        # 7) フラッシュ
+        for packet in out_v.encode(None):
+            out.mux(packet)
+        out.close()
 
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+        # 8) 正常終了したらアトミックリネーム
+        tmp_path.replace(output_path)
 
-    # Replicate input streams in output container
-    stream_map = {}
-    for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
-            )
-
-            # set the time base to the input stream time base (missing in the codec context)
-            stream_map[input_stream.index].time_base = input_stream.time_base
-
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
-
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
-
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
-    shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
+    except Exception:
+        # 失敗時は一時ファイルを掃除してから再送出
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        finally:
+            raise
 
 
 @dataclass

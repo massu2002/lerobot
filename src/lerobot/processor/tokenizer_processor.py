@@ -24,7 +24,9 @@ token IDs and attention masks, which are then added to the observation dictionar
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, List, Dict
+
+from transformers import CLIPTokenizer
 
 import torch
 
@@ -100,6 +102,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
             self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            if self.input_tokenizer.pad_token is None:
+                self.input_tokenizer.pad_token = self.input_tokenizer.eos_token
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
@@ -267,4 +271,127 @@ class TokenizerProcessorStep(ObservationProcessorStep):
                 type=FeatureType.LANGUAGE, shape=(self.max_length,)
             )
 
+        return features
+
+@dataclass
+class ClipTokenizerProcessorStep(ObservationProcessorStep):
+    """
+    CoTVLA / CLIP 用のトークナイズ ProcessorStep（Hugging Face 版）。
+
+    - complementary_data['task'] からタスク文字列を取り出す
+    - CLIPTokenizer で input_ids / attention_mask を生成
+    - OBS_LANGUAGE_TOKENS / OBS_LANGUAGE_ATTENTION_MASK を observation に追加
+    """
+
+    task_key: str = "task"
+    max_length: int = 77  # デフォルト。__post_init__ で tokenizer に合わせて上書き
+    clip_model_name: str = "openai/clip-vit-base-patch32"
+
+    # 内部で使う tokenizer インスタンス
+    _tokenizer: CLIPTokenizer = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        # Hugging Face の CLIPTokenizer をロード
+        self._tokenizer = CLIPTokenizer.from_pretrained(self.clip_model_name)
+
+        # tokenizer 側の max_length に合わせる（通常 77）
+        tokenizer_max_len = getattr(self._tokenizer, "model_max_length", None)
+        if tokenizer_max_len is not None and tokenizer_max_len > 0:
+            if self.max_length != tokenizer_max_len:
+                print(
+                    f"[ClipTokenizerProcessorStep] max_length={self.max_length} → "
+                    f"tokenizer.model_max_length={tokenizer_max_len} に揃えます。"
+                )
+            self.max_length = tokenizer_max_len
+
+    # ---- タスク文字列の取得 ----
+    def get_task(self, transition: EnvTransition) -> List[str]:
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA)
+        if complementary_data is None:
+            raise ValueError("Complementary data is None so no task can be extracted from it")
+
+        task = complementary_data.get(self.task_key, None)
+        if task is None:
+            raise ValueError(f"Task '{self.task_key}' is None in complementary data")
+
+        # string or list[str] を許容
+        if isinstance(task, str):
+            return [task]
+        elif isinstance(task, list) and all(isinstance(t, str) for t in task):
+            return task
+        else:
+            raise ValueError(f"Task must be str or list[str], got {type(task)}")
+
+    # ---- device の検出（元実装と同じロジック） ----
+    def _detect_device(self, transition: EnvTransition) -> torch.device | None:
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if observation:
+            for value in observation.values():
+                if isinstance(value, torch.Tensor):
+                    return value.device
+        action = transition.get(TransitionKey.ACTION)
+        if isinstance(action, torch.Tensor):
+            return action.device
+        return None
+
+    # ---- CLIPTokenizer でのトークナイズ ----
+    def _tokenize_text(self, texts: List[str]) -> Dict[str, torch.Tensor]:
+        """
+        Hugging Face の CLIPTokenizer を使って
+        - input_ids: [B, L]
+        - attention_mask: [B, L]
+        を生成する。
+        """
+        enc = self._tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        input_ids = enc["input_ids"]          # [B, L], long
+        attention_mask = enc["attention_mask"]  # [B, L], long (1: 有効, 0: pad)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+    # ---- Pipeline から呼ばれるメイン処理 ----
+    def observation(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        task 文字列を CLIP トークナイザで token 化し、
+        OBS_LANGUAGE_TOKENS / OBS_LANGUAGE_ATTENTION_MASK を observation に追加。
+        """
+        texts = self.get_task(self.transition)  # List[str]
+
+        tokenized = self._tokenize_text(texts)
+
+        # 既存テンソルの device を見て、そこに合わせる
+        target_device = self._detect_device(self.transition)
+        if target_device is not None:
+            tokenized = {
+                k: v.to(target_device) if isinstance(v, torch.Tensor) else v
+                for k, v in tokenized.items()
+            }
+
+        new_observation = dict(observation)
+        new_observation[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"]  # [B, L]
+        # attention_mask は bool に変換しておく
+        new_observation[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].to(dtype=torch.bool)  # [B, L]
+
+        return new_observation
+
+    # ---- 特徴量定義の更新（元 TokenizerProcessorStep の transform_features と同等） ----
+    def transform_features(
+        self, features: Dict[PipelineFeatureType, Dict[str, PolicyFeature]]
+    ) -> Dict[PipelineFeatureType, Dict[str, PolicyFeature]]:
+        if OBS_LANGUAGE_TOKENS not in features[PipelineFeatureType.OBSERVATION]:
+            features[PipelineFeatureType.OBSERVATION][OBS_LANGUAGE_TOKENS] = PolicyFeature(
+                type=FeatureType.LANGUAGE, shape=(self.max_length,)
+            )
+        if OBS_LANGUAGE_ATTENTION_MASK not in features[PipelineFeatureType.OBSERVATION]:
+            features[PipelineFeatureType.OBSERVATION][OBS_LANGUAGE_ATTENTION_MASK] = PolicyFeature(
+                type=FeatureType.LANGUAGE, shape=(self.max_length,)
+            )
         return features

@@ -19,6 +19,9 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from pyparsing import Dict
+import math
+import torch.nn.functional as F
 
 import datasets
 import numpy as np
@@ -29,6 +32,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.utils
+import warnings
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
@@ -199,7 +203,7 @@ class LeRobotDatasetMetadata:
         fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
 
-    def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+    def get_video_file_path(self, ep_index: int, vid_key: str):
         if self.episodes is None:
             self.episodes = load_episodes(self.root)
         if ep_index >= len(self.episodes):
@@ -209,7 +213,21 @@ class LeRobotDatasetMetadata:
         ep = self.episodes[ep_index]
         chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
         file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        
+        if chunk_idx is None or file_idx is None:
+            return None
+
+        try:
+            chunk_idx = int(chunk_idx)
+            file_idx = int(file_idx)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid chunk/file index types: chunk_index={chunk_idx} "
+                f"({type(chunk_idx)}), file_index={file_idx} ({type(file_idx)})"
+            ) from e
+        fpath = self.video_path.format(video_key=vid_key, 
+                                       chunk_index=chunk_idx, 
+                                       file_index=file_idx)
         return Path(fpath)
 
     @property
@@ -509,6 +527,7 @@ class LeRobotDatasetMetadata:
         obj = cls.__new__(cls)
         obj.repo_id = repo_id
         obj.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        print(f"Creating new LeRobotDatasetMetadata at {obj.root}")
 
         obj.root.mkdir(parents=True, exist_ok=False)
 
@@ -552,6 +571,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        use_dynamic_images: bool = False,
+        use_depth_maps: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -674,7 +695,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
-        self.delta_indices = None
+        # self.delta_indices = None
+        self.delta_indices = {"action": [0]}
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
 
@@ -697,14 +719,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._recorded_frames = self.meta.total_frames
         self._writer_closed_for_reading = False
 
-        # Load actual data
+        # Load hf_dataset
         try:
             if force_cache_sync:
                 raise FileNotFoundError
             self.hf_dataset = self.load_hf_dataset()
             # Check if cached dataset contains all requested episodes
             if not self._check_cached_episodes_sufficient():
-                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+                # 元のコード:
+                # raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+                warnings.warn(
+                    "Cached dataset doesn't contain all requested episodes. "
+                    "Skipping Hub download and using local cache as-is."
+                )
+                # ここで例外を投げない → except ブロックに行かない
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
@@ -712,9 +740,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
 
         # Setup delta_indices
-        if self.delta_timestamps is not None:
-            check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
-            self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+        # if self.delta_timestamps is not None:
+        #     check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
+        #     self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+            
+        # 深度マップと動的領域画像の設定
+        self.use_dynamic_images = use_dynamic_images
+        self.use_depth_maps = use_depth_maps
 
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
@@ -945,24 +977,165 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if key not in self.meta.video_keys
         }
 
+    # def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+    #     """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
+    #     in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
+    #     Segmentation Fault. This probably happens because a memory reference to the video loader is created in
+    #     the main process and a subprocess fails to access it.
+    #     """
+    #     ep = self.meta.episodes[ep_idx]
+    #     item = {}
+    #     for vid_key, query_ts in query_timestamps.items():
+    #         # Episodes are stored sequentially on a single mp4 to reduce the number of files.
+    #         # Thus we load the start timestamp of the episode on this mp4 and,
+    #         # shift the query timestamp accordingly.
+    #         from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+    #         shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+
+    #         video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+    #         frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+    #         item[vid_key] = frames.squeeze(0)
+
+    #     return item
+    
+    # def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+    #     """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
+    #     in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
+    #     Segmentation Fault. This probably happens because a memory reference to the video loader is created in
+    #     the main process and a subprocess fails to access it.
+    #     """
+    #     ep = self.meta.episodes[ep_idx]
+    #     item: dict[str, torch.Tensor] = {}
+
+    #     for vid_key, query_ts in query_timestamps.items():
+    #         # Episodes are stored sequentially on a single mp4 to reduce the number of files.
+    #         # Thus we load the start timestamp of the episode on this mp4 and,
+    #         # shift the query timestamp accordingly.
+
+    #         ts_key = f"videos/{vid_key}/from_timestamp"
+
+    #         # 1) from_timestamp を安全に取得（無い場合は None）
+    #         from_timestamp = ep.get(ts_key, None)
+
+    #         # もし list / array で入っている場合はスカラーにそろえる（保険）
+    #         try:
+    #             import numpy as np  # すでにどこかで import 済みなら不要
+    #             if isinstance(from_timestamp, (list, tuple, np.ndarray)):
+    #                 from_timestamp = from_timestamp[0] if len(from_timestamp) > 0 else None
+    #         except Exception:
+    #             # numpy 未使用 or ここに来ることはあまり無い想定なので握りつぶしでOK
+    #             pass
+
+    #         # 2) from_timestamp が None の dataset ではそのまま query_ts を使う
+    #         if from_timestamp is None:
+    #             shifted_query_ts = query_ts
+    #         else:
+    #             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+
+    #         if self.meta.get_video_file_path(ep_idx, vid_key) is None:
+    #             item[vid_key] = torch.empty(3, 480, 640)  # ダミー画像
+    #             return item
+    #         video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+    #         frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+    #         item[vid_key] = frames.squeeze(0)
+
+    #     return item
+    
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
-        """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
-        in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
-        Segmentation Fault. This probably happens because a memory reference to the video loader is created in
-        the main process and a subprocess fails to access it.
+        """
+        指定された ep_idx について、各ビデオキー vid_key のフレームを読み込む。
+
+        - query_timestamps[vid_key]: そのエピソード時間基準の相対 timestamp のリスト（秒）
+        - ep の meta 内に videos/{vid_key}/from_timestamp, chunk_index, file_index が無い or NaN の場合は
+        → このエピソードではこのカメラは使えないとみなして AssertionError を投げる。
+        - 実動画の decode に失敗した場合も AssertionError をそのまま上げる。
+        → 上位の SequenceLeRobotDataset でキャッチしてサンプルをスキップさせる想定。
+
+        これにより「問題のあるサンプルは丸ごとスキップ」され、
+        ダミーフレームで誤魔化すことがなくなる。
         """
         ep = self.meta.episodes[ep_idx]
-        item = {}
-        for vid_key, query_ts in query_timestamps.items():
-            # Episodes are stored sequentially on a single mp4 to reduce the number of files.
-            # Thus we load the start timestamp of the episode on this mp4 and,
-            # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+        item: Dict[str, torch.Tensor] = {}
 
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+        # CoT-VLA 側で使うターゲット解像度（必要に応じて cfg から取る）
+        target_h, target_w = 480, 640
+
+        for vid_key, query_ts in query_timestamps.items():
+            # --- meta からインデックスと from_timestamp を取得 ---
+            chunk_col = f"videos/{vid_key}/chunk_index"
+            file_col  = f"videos/{vid_key}/file_index"
+            ts_col    = f"videos/{vid_key}/from_timestamp"
+
+            # ep は dict-like (Arrow の row) を想定
+            chunk_idx = ep.get(chunk_col, None)
+            file_idx  = ep.get(file_col, None)
+            from_timestamp = ep.get(ts_col, None)
+
+            # どれか無い / NaN なら、このエピソードではこのカメラは使えない
+            def _is_nan(x):
+                try:
+                    return x is None or (isinstance(x, float) and math.isnan(x))
+                except TypeError:
+                    return False
+
+            if _is_nan(chunk_idx) or _is_nan(file_idx) or _is_nan(from_timestamp):
+                # ここで dummy を返さず、上位にスキップさせる
+                raise AssertionError(
+                    f"[LeRobotDataset._query_videos] Missing or NaN meta for "
+                    f"video key={vid_key}, ep_idx={ep_idx} "
+                    f"(chunk={chunk_idx}, file={file_idx}, from_ts={from_timestamp})"
+                )
+
+            # --- from_timestamp を足して「動画ファイル基準の絶対 timestamp」に変換 ---
+            shifted_query_ts = [float(from_timestamp) + float(ts) for ts in query_ts]
+
+            # --- 動画パスの取得 ---
+            rel_path = self.meta.get_video_file_path(ep_idx, vid_key)
+            if rel_path is None:
+                # ここも dummy ではなくエラーにする
+                raise AssertionError(
+                    f"[LeRobotDataset._query_videos] No video path for "
+                    f"video key={vid_key}, ep_idx={ep_idx}"
+                )
+
+            video_path = self.root / rel_path
+
+            # --- フレーム読み込み ---
+            # ここで decode_video_frames_torchvision 内の AssertionError (tolerance) が発生することがある。
+            # それもそのまま上の SequenceLeRobotDataset でキャッチしてスキップさせる。
+            frames = decode_video_frames(
+                video_path,
+                shifted_query_ts,
+                self.tolerance_s,
+                self.video_backend,
+            )
+
+            # frames shape の整理
+            # LeRobot の実装では通常 [T, C, H, W] で返るので、
+            # クエリ数 1 の場合は [1, C, H, W] → squeeze して [C, H, W] を返す。
+            if frames.dim() == 4 and frames.shape[0] == 1:
+                frames = frames.squeeze(0)  # [C, H, W]
+            elif frames.dim() == 3:
+                # 既に [C, H, W]
+                pass
+            else:
+                # 必要ならここで T>1 をサポートするように拡張してもよい
+                raise RuntimeError(
+                    f"Unexpected frames shape {frames.shape} for vid_key={vid_key}, "
+                    f"query_timestamps={query_ts}"
+                )
+
+            C, H, W = frames.shape
+            if (H != target_h) or (W != target_w):
+                # [C, H, W] → [1, C, H, W] にしてから resize
+                frames = F.interpolate(
+                    frames.unsqueeze(0).float(),       # [1, C, H, W]
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)                            # [C, target_h, target_w]
+
+            item[vid_key] = frames
 
         return item
 
@@ -977,13 +1150,53 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self._lazy_loading = False
 
     def __len__(self):
-        return self.num_frames
+        return len(self.hf_dataset)
 
+    # def __getitem__(self, idx) -> dict:
+    #     # Ensure dataset is loaded when we actually need to read from it
+    #     self._ensure_hf_dataset_loaded()
+    #     item = self.hf_dataset[idx]
+    #     ep_idx = item["episode_index"].item()
+
+    #     query_indices = None
+    #     if self.delta_indices is not None:
+    #         query_indices, padding = self._get_query_indices(idx, ep_idx)
+    #         query_result = self._query_hf_dataset(query_indices)
+    #         item = {**item, **padding}
+    #         for key, val in query_result.items():
+    #             item[key] = val
+
+    #     if len(self.meta.video_keys) > 0:
+    #         current_ts = item["timestamp"].item()
+    #         query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+    #         video_frames = self._query_videos(query_timestamps, ep_idx)
+    #         item = {**video_frames, **item}
+
+    #     if self.image_transforms is not None:
+    #         image_keys = self.meta.camera_keys
+    #         for cam in image_keys:
+    #             item[cam] = self.image_transforms(item[cam])
+
+    #     # Add task as a string
+    #     task_idx = item["task_index"].item()
+    #     item["task"] = self.meta.tasks.iloc[task_idx].name
+    #     return item
+    
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
         item = self.hf_dataset[idx]
+
         ep_idx = item["episode_index"].item()
+
+        # 🔴 ここで meta.episodes の範囲チェックを行う
+        n_episodes = len(self.meta.episodes)
+        if ep_idx < 0 or ep_idx >= n_episodes:
+            # SequenceLeRobotDataset 側で AssertionError をキャッチしてスキップできるようにする
+            raise AssertionError(
+                f"[LeRobotDataset.__getitem__] Invalid episode_index={ep_idx} "
+                f"for episodes size={n_episodes} (idx={idx})"
+            )
 
         query_indices = None
         if self.delta_indices is not None:
@@ -1002,6 +1215,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys
             for cam in image_keys:
+                if cam not in item:
+                    raise AssertionError(
+                        f"[LeRobotDataset.__getitem__] Missing camera '{cam}' "
+                        f"for idx={idx}, ep_idx={ep_idx}"
+                    )
                 item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string

@@ -83,6 +83,9 @@ from lerobot.datasets.video_utils import concatenate_video_files, get_video_dura
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
 
+from lerobot.datasets.v21 import convert_dataset_v20_to_v21
+
+V20 = "v2.0"
 V21 = "v2.1"
 V30 = "v3.0"
 
@@ -139,12 +142,16 @@ def legacy_load_episodes(local_dir: Path) -> dict:
     return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
 
 
-def legacy_load_episodes_stats(local_dir: Path) -> dict:
-    episodes_stats = load_jsonlines(local_dir / LEGACY_EPISODES_STATS_PATH)
-    return {
-        item["episode_index"]: cast_stats_to_numpy(item["stats"])
-        for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
-    }
+def legacy_load_episodes_stats(local_dir: Path, dataset_version: str = V21) -> dict:
+    if dataset_version == V20:
+        episodes_stats = load_jsonlines(local_dir / "meta/episodes.jsonl")
+        print(episodes_stats)
+    else:
+        episodes_stats = load_jsonlines(local_dir / LEGACY_EPISODES_STATS_PATH)
+        return {
+            item["episode_index"]: cast_stats_to_numpy(item["stats"])
+            for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
+        }
 
 
 def legacy_load_tasks(local_dir: Path) -> tuple[dict, dict]:
@@ -158,11 +165,12 @@ def validate_local_dataset_version(local_path: Path) -> None:
     """Validate that the local dataset has the expected v2.1 version."""
     info = load_info(local_path)
     dataset_version = info.get("codebase_version", "unknown")
-    if dataset_version != V21:
+    if dataset_version not in [V21, V20]:
         raise ValueError(
             f"Local dataset has codebase version '{dataset_version}', expected '{V21}'. "
             f"This script is specifically for converting v2.1 datasets to v3.0."
         )
+    return dataset_version
 
 
 def convert_tasks(root, new_root):
@@ -401,11 +409,11 @@ def generate_episode_metadata_dict(
         yield ep_dict
 
 
-def convert_episodes_metadata(root, new_root, episodes_metadata, episodes_video_metadata=None):
+def convert_episodes_metadata(root, new_root, episodes_metadata, episodes_video_metadata=None, dataset_version=None):
     logging.info(f"Converting episodes metadata from {root} to {new_root}")
 
     episodes_legacy_metadata = legacy_load_episodes(root)
-    episodes_stats = legacy_load_episodes_stats(root)
+    episodes_stats = legacy_load_episodes_stats(root, dataset_version=dataset_version)
 
     num_eps_set = {len(episodes_legacy_metadata), len(episodes_metadata)}
     if episodes_video_metadata is not None:
@@ -471,17 +479,17 @@ def convert_dataset(
     use_local_dataset = False
     root = HF_LEROBOT_HOME / repo_id if root is None else Path(root) / repo_id
     if root.exists():
-        validate_local_dataset_version(root)
+        dataset_version = validate_local_dataset_version(root)
         use_local_dataset = True
         print(f"Using local dataset at {root}")
 
-    old_root = root.parent / f"{root.name}_old"
+    # old_root = root.parent / f"{root.name}_old"
     new_root = root.parent / f"{root.name}_v30"
 
     # Handle old_root cleanup if both old_root and root exist
-    if old_root.is_dir() and root.is_dir():
-        shutil.rmtree(str(root))
-        shutil.move(str(old_root), str(root))
+    # if old_root.is_dir() and root.is_dir():
+    #     shutil.rmtree(str(root))
+    #     shutil.move(str(old_root), str(root))
 
     if new_root.is_dir():
         shutil.rmtree(new_root)
@@ -498,9 +506,11 @@ def convert_dataset(
     convert_tasks(root, new_root)
     episodes_metadata = convert_data(root, new_root, data_file_size_in_mb)
     episodes_videos_metadata = convert_videos(root, new_root, video_file_size_in_mb)
-    convert_episodes_metadata(root, new_root, episodes_metadata, episodes_videos_metadata)
+    convert_episodes_metadata(root, new_root, episodes_metadata, episodes_videos_metadata, dataset_version)
 
-    shutil.move(str(root), str(old_root))
+    # shutil.move(str(root), str(old_root))
+    if root.exists():
+        shutil.rmtree(root)
     shutil.move(str(new_root), str(root))
 
     if push_to_hub:

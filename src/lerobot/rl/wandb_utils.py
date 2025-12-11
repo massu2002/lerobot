@@ -18,9 +18,12 @@ import os
 import re
 from glob import glob
 from pathlib import Path
+from typing import Any
+import numpy as np
 
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from termcolor import colored
+import torch
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
@@ -114,6 +117,27 @@ class WandBLogger:
         artifact = self._wandb.Artifact(artifact_name, type="model")
         artifact.add_file(checkpoint_dir / PRETRAINED_MODEL_DIR / SAFETENSORS_SINGLE_FILE)
         self._wandb.log_artifact(artifact)
+        
+    def _to_wandb_value(self, v: Any):
+        """
+        WandB にそのまま渡せる型に変換するヘルパー。
+        - torch.Tensor: スカラーなら .item() に変換、それ以外は None（スキップ）
+        - numpy スカラー: .item()
+        - それ以外: そのまま返す
+        """
+        # torch.Tensor の場合
+        if torch.is_tensor(v):
+            # スカラー Tensor の場合のみログに流す
+            if v.numel() == 1:
+                return v.detach().cpu().item()
+            else:
+                return None  # 多次元テンソルはここでは扱わない
+
+        # numpy のスカラー
+        if isinstance(v, np.generic):
+            return v.item()
+
+        return v
 
     def log_dict(
         self, d: dict, step: int | None = None, mode: str = "train", custom_step_key: str | None = None
@@ -137,19 +161,34 @@ class WandBLogger:
                 self._wandb.define_metric(new_custom_key, hidden=True)
 
         for k, v in d.items():
-            if not isinstance(v, (int | float | str)):
+            # まず WandB 用に変換
+            v = self._to_wandb_value(v)
+
+            # ここは Union ではなく tuple で書く方が正しい
+            if not isinstance(v, (int, float, str)):
                 logging.warning(
                     f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'
                 )
                 continue
 
             # Do not log the custom step key itself.
-            if self._wandb_custom_step_key is not None and k in self._wandb_custom_step_key:
+            if self._wandb_custom_step_key is not None and k == self._wandb_custom_step_key:
+                # ↑ "in" だと部分一致になるので基本は == の方が安全です
                 continue
 
             if custom_step_key is not None:
-                value_custom_step = d[custom_step_key]
-                data = {f"{mode}/{k}": v, f"{mode}/{custom_step_key}": value_custom_step}
+                value_custom_step = self._to_wandb_value(d[custom_step_key])
+                if not isinstance(value_custom_step, (int, float, str)):
+                    logging.warning(
+                        f'WandB logging of custom step key "{custom_step_key}" was ignored '
+                        f'as its type "{type(value_custom_step)}" is not handled by this wrapper.'
+                    )
+                    continue
+
+                data = {
+                    f"{mode}/{k}": v,
+                    f"{mode}/{custom_step_key}": value_custom_step,
+                }
                 self._wandb.log(data)
                 continue
 

@@ -1462,6 +1462,14 @@ class ObservationProcessorStep(ProcessorStep, ABC):
 
         processed_observation = self.observation(observation.copy())
         new_transition[TransitionKey.OBSERVATION] = processed_observation
+        
+        future_observation = new_transition.get(TransitionKey.FUTURE_OBSERVATION)
+        if future_observation is None or not isinstance(future_observation, dict):
+            raise ValueError("ObservationProcessorStep requires a future_observation in the transition.")
+        
+        processed_future_observation = self.observation(future_observation.copy())
+        new_transition[TransitionKey.FUTURE_OBSERVATION] = processed_future_observation
+
         return new_transition
 
 

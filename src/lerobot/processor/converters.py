@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.utils.constants import ACTION, DONE, OBS_PREFIX, REWARD, TRUNCATED
+from lerobot.utils.constants import ACTION, DONE, FUTURE_OBS_PREFIX, OBS_PREFIX, REWARD, TRUNCATED
 
 from .core import EnvTransition, PolicyAction, RobotAction, RobotObservation, TransitionKey
 
@@ -176,6 +176,7 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
 
 def create_transition(
     observation: dict[str, Any] | None = None,
+    future_observation: dict[str, Any] | None = None,
     action: PolicyAction | RobotAction | None = None,
     reward: float = 0.0,
     done: bool = False,
@@ -200,6 +201,7 @@ def create_transition(
     """
     return {
         TransitionKey.OBSERVATION: observation,
+        TransitionKey.FUTURE_OBSERVATION: future_observation,
         TransitionKey.ACTION: action,
         TransitionKey.REWARD: reward,
         TransitionKey.DONE: done,
@@ -350,10 +352,12 @@ def batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
 
     # Extract observation and complementary data keys.
     observation_keys = {k: v for k, v in batch.items() if k.startswith(OBS_PREFIX)}
+    future_observation_keys = {k: v for k, v in batch.items() if k.startswith(FUTURE_OBS_PREFIX)}
     complementary_data = _extract_complementary_data(batch)
 
     return create_transition(
         observation=observation_keys if observation_keys else None,
+        future_observation=future_observation_keys if future_observation_keys else None,
         action=batch.get(ACTION),
         reward=batch.get(REWARD, 0.0),
         done=batch.get(DONE, False),
@@ -395,6 +399,11 @@ def transition_to_batch(transition: EnvTransition) -> dict[str, Any]:
     observation = transition.get(TransitionKey.OBSERVATION)
     if isinstance(observation, dict):
         batch.update(observation)
+        
+    # Flatten future observation dictionary.
+    future_observation = transition.get(TransitionKey.FUTURE_OBSERVATION)
+    if isinstance(future_observation, dict):
+        batch.update(future_observation)
 
     return batch
 

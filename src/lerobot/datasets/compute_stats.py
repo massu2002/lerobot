@@ -529,8 +529,28 @@ def compute_episode_stats(
     return ep_stats
 
 
-def _validate_stat_value(value: np.ndarray, key: str, feature_key: str) -> None:
-    """Validate a single statistic value."""
+# def _validate_stat_value(value: np.ndarray, key: str, feature_key: str) -> None:
+#     """Validate a single statistic value."""
+#     if not isinstance(value, np.ndarray):
+#         raise ValueError(
+#             f"Stats must be composed of numpy array, but key '{key}' of feature '{feature_key}' "
+#             f"is of type '{type(value)}' instead."
+#         )
+
+#     if value.ndim == 0:
+#         raise ValueError("Number of dimensions must be at least 1, and is 0 instead.")
+
+#     if key == "count" and value.shape != (1,):
+#         raise ValueError(f"Shape of 'count' must be (1), but is {value.shape} instead.")
+
+#     if "image" in feature_key and key != "count" and value.shape != (3, 1, 1):
+#         raise ValueError(f"Shape of quantile '{key}' must be (3,1,1), but is {value.shape} instead.")
+
+def _validate_stat_value(
+    value: np.ndarray, key: str, feature_key: str,
+    *, allow_grayscale_for_image: bool = True, upcast_to_rgb: bool = True
+) -> np.ndarray:
+    """Validate a single statistic value and (optionally) upcast grayscale image stats to RGB."""
     if not isinstance(value, np.ndarray):
         raise ValueError(
             f"Stats must be composed of numpy array, but key '{key}' of feature '{feature_key}' "
@@ -540,12 +560,25 @@ def _validate_stat_value(value: np.ndarray, key: str, feature_key: str) -> None:
     if value.ndim == 0:
         raise ValueError("Number of dimensions must be at least 1, and is 0 instead.")
 
-    if key == "count" and value.shape != (1,):
-        raise ValueError(f"Shape of 'count' must be (1), but is {value.shape} instead.")
+    # 'count' は (1,) 固定
+    if key == "count":
+        if value.shape != (1,):
+            raise ValueError(f"Shape of 'count' must be (1), but is {value.shape} instead.")
+        return value
 
-    if "image" in feature_key and key != "count" and value.shape != (3, 1, 1):
+    # 画像系は (3,1,1) を原則要求。ただし (1,1,1) の場合は許可して 3ch にアップキャスト可
+    if "image" in feature_key and key != "count":
+        if value.shape == (3, 1, 1):
+            return value
+        if allow_grayscale_for_image and value.shape == (1, 1, 1):
+            # 要求があれば 1→3ch に拡張（チャネル複製）
+            if upcast_to_rgb:
+                value = np.repeat(value, 3, axis=0)  # (1,1,1) → (3,1,1)
+            return value
         raise ValueError(f"Shape of quantile '{key}' must be (3,1,1), but is {value.shape} instead.")
 
+    # 非画像系は現状そのまま通す（必要ならここに他のshape規則を追加）
+    return value
 
 def _assert_type_and_shape(stats_list: list[dict[str, dict]]):
     """Validate that all statistics have correct types and shapes.
@@ -559,7 +592,7 @@ def _assert_type_and_shape(stats_list: list[dict[str, dict]]):
     for stats in stats_list:
         for feature_key, feature_stats in stats.items():
             for stat_key, stat_value in feature_stats.items():
-                _validate_stat_value(stat_value, stat_key, feature_key)
+                feature_stats[stat_key] = _validate_stat_value(stat_value, stat_key, feature_key)
 
 
 def aggregate_feature_stats(stats_ft_list: list[dict[str, dict]]) -> dict[str, dict[str, np.ndarray]]:

@@ -63,7 +63,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # automatic gradient scaling is used.
     use_amp: bool = False
 
-    push_to_hub: bool = True  # type: ignore[assignment] # TODO: use a different name to avoid override
+    push_to_hub: bool = False  # type: ignore[assignment] # TODO: use a different name to avoid override
     repo_id: str | None = None
 
     # Upload on private repository on the Hugging Face hub.
@@ -137,9 +137,25 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                 return ft
         return None
 
+    # @property
+    # def image_features(self) -> dict[str, PolicyFeature]:
+    #     return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
+    
     @property
     def image_features(self) -> dict[str, PolicyFeature]:
-        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
+        # 1. まず既存の VISUAL 特徴のみを抽出
+        visual_feats = {
+            key: ft for key, ft in self.input_features.items()
+            if ft.type is FeatureType.VISUAL
+        }
+
+        # 2. 既存の front / wrist があれば、それをコピーして future_ に追加
+        if "observation.images.front" in visual_feats:
+            visual_feats["future_observation.images.front"] = visual_feats["observation.images.front"]
+        if "observation.images.wrist" in visual_feats:
+            visual_feats["future_observation.images.wrist"] = visual_feats["observation.images.wrist"]
+
+        return visual_feats
 
     @property
     def action_feature(self) -> PolicyFeature | None:

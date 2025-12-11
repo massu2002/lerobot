@@ -19,6 +19,8 @@ from huggingface_hub.constants import HF_HOME
 
 OBS_STR = "observation"
 OBS_PREFIX = OBS_STR + "."
+FUTURE_OBS_STR = "future_observation"
+FUTURE_OBS_PREFIX = FUTURE_OBS_STR + "."
 OBS_ENV_STATE = OBS_STR + ".environment_state"
 OBS_STATE = OBS_STR + ".state"
 OBS_IMAGE = OBS_STR + ".image"
@@ -57,7 +59,8 @@ if "LEROBOT_HOME" in os.environ:
 
 # cache dir
 default_cache_path = Path(HF_HOME) / "lerobot"
-HF_LEROBOT_HOME = Path(os.getenv("HF_LEROBOT_HOME", default_cache_path)).expanduser()
+# HF_LEROBOT_HOME = Path(os.getenv("HF_LEROBOT_HOME", default_cache_path)).expanduser()
+HF_LEROBOT_HOME = Path("/home/data01/smolvla")
 
 # calibration dir
 default_calibration_path = HF_LEROBOT_HOME / "calibration"

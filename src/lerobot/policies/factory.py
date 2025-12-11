@@ -30,6 +30,7 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.cotvla.configuration_cotvla import CoTVLAConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -100,8 +101,11 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         return Classifier
     elif name == "smolvla":
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        
+    elif name == "cotvla":
+        from lerobot.policies.cotvla.modeling_cotvla import CoTVLAPolicy
 
-        return SmolVLAPolicy
+        return CoTVLAPolicy
     elif name == "groot":
         from lerobot.policies.groot.modeling_groot import GrootPolicy
 
@@ -145,6 +149,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
+    elif policy_type == "cotvla":
+        return CoTVLAConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
     elif policy_type == "groot":
@@ -317,6 +323,14 @@ def make_pre_post_processors(
         from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+        
+    elif isinstance(policy_cfg, CoTVLAConfig):
+        from lerobot.policies.cotvla.processor_cotvla import make_cotvla_pre_post_processors
+
+        processors = make_cotvla_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

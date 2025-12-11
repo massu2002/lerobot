@@ -452,6 +452,13 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
                 observation, inverse=False
             )
 
+        # Handle future observation normalization.
+        future_observation = new_transition.get(TransitionKey.FUTURE_OBSERVATION)
+        if future_observation is not None:
+            new_transition[TransitionKey.FUTURE_OBSERVATION] = self._normalize_observation(
+                future_observation, inverse=False
+            )
+            
         # Handle action normalization.
         action = new_transition.get(TransitionKey.ACTION)
 

@@ -15,6 +15,7 @@
 # limitations under the License.
 import contextlib
 import importlib.resources
+from itertools import accumulate
 import json
 import logging
 from collections import deque
@@ -24,6 +25,7 @@ from pprint import pformat
 from typing import Any, Generic, TypeVar
 
 import datasets
+import jsonlines
 import numpy as np
 import packaging.version
 import pandas
@@ -52,6 +54,7 @@ DEFAULT_VIDEO_FILE_SIZE_IN_MB = 500  # Max size per file
 
 INFO_PATH = "meta/info.json"
 STATS_PATH = "meta/stats.json"
+TASKS_PATH = "meta/tasks.jsonl"
 
 EPISODES_DIR = "meta/episodes"
 DATA_DIR = "data"
@@ -78,6 +81,109 @@ DEFAULT_FEATURES = {
 
 T = TypeVar("T")
 
+def backward_compatible_episodes_stats(
+    stats: dict[str, dict[str, np.ndarray]], episodes: list[int]
+) -> dict[str, dict[str, np.ndarray]]:
+    return dict.fromkeys(episodes, stats)
+
+def check_timestamps_sync(
+    timestamps: np.ndarray,
+    episode_indices: np.ndarray,
+    episode_data_index: dict[str, np.ndarray],
+    fps: int,
+    tolerance_s: float,
+    raise_value_error: bool = True,
+) -> bool:
+    """
+    This check is to make sure that each timestamp is separated from the next by (1/fps) +/- tolerance
+    to account for possible numerical error.
+
+    Args:
+        timestamps (np.ndarray): Array of timestamps in seconds.
+        episode_indices (np.ndarray): Array indicating the episode index for each timestamp.
+        episode_data_index (dict[str, np.ndarray]): A dictionary that includes 'to',
+            which identifies indices for the end of each episode.
+        fps (int): Frames per second. Used to check the expected difference between consecutive timestamps.
+        tolerance_s (float): Allowed deviation from the expected (1/fps) difference.
+        raise_value_error (bool): Whether to raise a ValueError if the check fails.
+
+    Returns:
+        bool: True if all checked timestamp differences lie within tolerance, False otherwise.
+
+    Raises:
+        ValueError: If the check fails and `raise_value_error` is True.
+    """
+    if timestamps.shape != episode_indices.shape:
+        raise ValueError(
+            "timestamps and episode_indices should have the same shape. "
+            f"Found {timestamps.shape=} and {episode_indices.shape=}."
+        )
+
+    # Consecutive differences
+    diffs = np.diff(timestamps)
+    within_tolerance = np.abs(diffs - (1.0 / fps)) <= tolerance_s
+
+    # Mask to ignore differences at the boundaries between episodes
+    mask = np.ones(len(diffs), dtype=bool)
+    ignored_diffs = episode_data_index["to"][:-1] - 1  # indices at the end of each episode
+    mask[ignored_diffs] = False
+    filtered_within_tolerance = within_tolerance[mask]
+
+    # Check if all remaining diffs are within tolerance
+    if not np.all(filtered_within_tolerance):
+        # Track original indices before masking
+        original_indices = np.arange(len(diffs))
+        filtered_indices = original_indices[mask]
+        outside_tolerance_filtered_indices = np.nonzero(~filtered_within_tolerance)[0]
+        outside_tolerance_indices = filtered_indices[outside_tolerance_filtered_indices]
+
+        outside_tolerances = []
+        for idx in outside_tolerance_indices:
+            entry = {
+                "timestamps": [timestamps[idx], timestamps[idx + 1]],
+                "diff": diffs[idx],
+                "episode_index": episode_indices[idx].item()
+                if hasattr(episode_indices[idx], "item")
+                else episode_indices[idx],
+            }
+            outside_tolerances.append(entry)
+
+        if raise_value_error:
+            raise ValueError(
+                f"""One or several timestamps unexpectedly violate the tolerance inside episode range.
+                This might be due to synchronization issues during data collection.
+                \n{pformat(outside_tolerances)}"""
+            )
+        return False
+
+    return True
+
+def get_episode_data_index(
+    episode_dicts: dict[dict], episodes: list[int] | None = None
+) -> dict[str, torch.Tensor]:
+    episode_lengths = {ep_idx: ep_dict["length"] for ep_idx, ep_dict in episode_dicts.items()}
+    if episodes is not None:
+        episode_lengths = {ep_idx: episode_lengths[ep_idx] for ep_idx in episodes}
+
+    cumulative_lengths = list(accumulate(episode_lengths.values()))
+    return {
+        "from": torch.LongTensor([0] + cumulative_lengths[:-1]),
+        "to": torch.LongTensor(cumulative_lengths),
+    }
+    
+def load_jsonlines(fpath: Path) -> list[Any]:
+    with jsonlines.open(fpath, "r") as reader:
+        return list(reader)
+
+def load_episodes_stats(local_dir: Path) -> dict:
+    episodes_stats = load_jsonlines(local_dir / LEGACY_EPISODES_STATS_PATH)
+    return {
+        item["episode_index"]: cast_stats_to_numpy(item["stats"])
+        for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
+    }
+    
+def write_episode(episode: dict, local_dir: Path):
+    append_jsonlines(episode, local_dir / LEGACY_EPISODES_PATH)
 
 def get_parquet_file_size_in_mb(parquet_path: str | Path) -> float:
     metadata = pq.read_metadata(parquet_path)
@@ -297,6 +403,16 @@ def write_stats(stats: dict, local_dir: Path) -> None:
     serialized_stats = serialize_dict(stats)
     write_json(serialized_stats, local_dir / STATS_PATH)
 
+def append_jsonlines(data: dict, fpath: Path) -> None:
+    fpath.parent.mkdir(exist_ok=True, parents=True)
+    with jsonlines.open(fpath, "a") as writer:
+        writer.write(data)
+
+def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path):
+    # We wrap episode_stats in a dictionary since `episode_stats["episode_index"]`
+    # is a dictionary of stats and not an integer.
+    episode_stats = {"episode_index": episode_index, "stats": serialize_dict(episode_stats)}
+    append_jsonlines(episode_stats, local_dir / LEGACY_EPISODES_STATS_PATH)
 
 def cast_stats_to_numpy(stats: dict) -> dict[str, dict[str, np.ndarray]]:
     """Recursively cast numerical values in a stats dictionary to numpy arrays.
@@ -339,6 +455,13 @@ def load_tasks(local_dir: Path) -> pandas.DataFrame:
     return tasks
 
 
+def load_tasks_v21(local_dir: Path) -> tuple[dict, dict]:
+    tasks = load_jsonlines(local_dir / TASKS_PATH)
+    tasks = {item["task_index"]: item["task"] for item in sorted(tasks, key=lambda x: x["task_index"])}
+    task_to_task_index = {task: task_index for task_index, task in tasks.items()}
+    return tasks, task_to_task_index
+
+
 def write_episodes(episodes: Dataset, local_dir: Path) -> None:
     """Write episode metadata to a parquet file in the LeRobot v3.0 format.
     This function writes episode-level metadata to a single parquet file.
@@ -369,6 +492,9 @@ def load_episodes(local_dir: Path) -> datasets.Dataset:
     episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
     return episodes
 
+def load_episodes_v21(local_dir: Path) -> dict:
+    episodes = load_jsonlines(local_dir / LEGACY_EPISODES_PATH)
+    return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
 
 def load_image_as_numpy(
     fpath: str | Path, dtype: np.dtype = np.float32, channel_first: bool = True

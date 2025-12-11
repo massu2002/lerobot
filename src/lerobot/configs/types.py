@@ -29,6 +29,7 @@ class FeatureType(str, Enum):
 class PipelineFeatureType(str, Enum):
     ACTION = "ACTION"
     OBSERVATION = "OBSERVATION"
+    FUTURE_OBSERVATION = "FUTURE_OBSERVATION"
 
 
 class NormalizationMode(str, Enum):

@@ -28,6 +28,7 @@ class TransitionKey(str, Enum):
 
     # TODO(Steven): Use consts
     OBSERVATION = "observation"
+    FUTURE_OBSERVATION = "future_observation"
     ACTION = "action"
     REWARD = "reward"
     DONE = "done"
@@ -46,6 +47,7 @@ EnvTransition = TypedDict(
     "EnvTransition",
     {
         TransitionKey.OBSERVATION.value: dict[str, Any] | None,
+        TransitionKey.FUTURE_OBSERVATION.value: dict[str, Any] | None,
         TransitionKey.ACTION.value: PolicyAction | RobotAction | EnvAction | None,
         TransitionKey.REWARD.value: float | torch.Tensor | None,
         TransitionKey.DONE.value: bool | torch.Tensor | None,
