@@ -166,6 +166,9 @@ wandb/
 # Data folders
 data/
 outputs/
+checkpoints/
+create_data/
+smolvla_base/
 
 # Translations
 *.mo
