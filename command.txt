@@ -1,0 +1,2 @@
+ssh masuoka@<ノード名>
+tmux attach -t job_<JOBID>

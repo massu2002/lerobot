@@ -165,6 +165,7 @@ wandb/
 
 # Data folders
 data/
+finetune_dataset/
 outputs/
 checkpoints/
 create_data/
@@ -180,3 +181,5 @@ smolvla_base/
 *.urdf
 *.xml
 *.part
+
+

@@ -59,8 +59,8 @@ if "LEROBOT_HOME" in os.environ:
 
 # cache dir
 default_cache_path = Path(HF_HOME) / "lerobot"
-# HF_LEROBOT_HOME = Path(os.getenv("HF_LEROBOT_HOME", default_cache_path)).expanduser()
-HF_LEROBOT_HOME = Path("/home/data01/smolvla")
+HF_LEROBOT_HOME = Path(os.getenv("HF_LEROBOT_HOME", default_cache_path)).expanduser()
+# HF_LEROBOT_HOME = os.getenv("HF_LEROBOT_HOME", "/default/path/to/lerobot")
 
 # calibration dir
 default_calibration_path = HF_LEROBOT_HOME / "calibration"

@@ -428,7 +428,6 @@ class CoTVLA(nn.Module):
         self.use_gradient_checkpointing = False
 
     # ----- init helpers -----
-
     def initialize_weights(self):
         # Visual CoT デコーダの pos embed を sin-cos で初期化
         image_decoder_position_embedding_obs = get_2d_sincos_pos_embed(
@@ -988,9 +987,10 @@ class CoTVLA(nn.Module):
                 with torch.no_grad():
                     arm_pred_action = self.action_model.sample(
                         z=cond_z,
-                        shape=(B, self.n_action_steps, self.action_dim),
+                        n_action_steps=self.n_action_steps,
+                        action_dim=self.action_dim,
                         use_ddim=True,
-                        ddim_steps=10,
+                        ddim_step=10,
                         device=cond_z.device,
                     )
 

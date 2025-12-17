@@ -234,8 +234,9 @@ class CoTVLAPolicy(PreTrainedPolicy):
         self.config = config
 
         # 公式実装に基づいた CoTVLA 本体
+        print("device:", config.device)
         self.model = CoTVLA(
-            clip_device="cuda" if torch.cuda.is_available() else "cpu",
+            clip_device=config.device,
             vit_checkpoint_path=config.vit_checkpoint_path,
             n_obs_steps=config.n_obs_steps,
             num_resampler_query=config.num_resampler_query,
@@ -257,6 +258,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
             attn_implementation=config.attn_implementation,
             obs_pred=config.obs_pred,
         )
+        self.model.to(config.device)
 
         self.reset()
 
@@ -283,30 +285,23 @@ class CoTVLAPolicy(PreTrainedPolicy):
     ) -> Tensor:
         """(B, T, ·) のバッチから (B, n_action_steps, action_dim) のアクション列を生成。"""
 
-        # もし将来、他の履歴キュー（画像履歴など）を追加する場合のためのテンプレ。
-        for k in batch:
-            if k in self._queues and k != ACTION:
-                # ACTION 以外のキーは履歴キューを stack して時間次元として渡す
-                batch[k] = torch.stack(list(self._queues[k]), dim=1)
-
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
-        # CoTVLA 固有: もし入力として世界知識を与える設計にしている場合はここで準備
-        world_knowledge = self.prepare_world_knowledge(batch)
-
         # CoTVLA 本体でアクションをサンプリング
-        actions = self.model.sample_actions(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            state,
-            world_knowledge,
-            noise=noise,
-        )  # (B, n_action_steps, padded_action_dim)
+        arm_pred_action, _, image_pred, _ = self.model.forward(
+            image_primary=images[1],
+            image_wrist=images[0],
+            state=state,
+            text_token=lang_tokens,
+            text_attn=lang_masks,
+            mode="inference",
+            future_image_primary=images[2],
+            future_image_wrist=images[3] if len(images) > 3 else None,
+        )
+        actions = arm_pred_action  # (B, n_action_steps, action_dim)
 
         # パディングした action_dim を元のサイズに戻す
         original_action_dim = self.config.action_feature.shape[0]
@@ -337,7 +332,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
         self.eval()
 
         batch = self._prepare_batch(batch)
-        # ACTION 以外の履歴をキューに詰めたい場合のためのヘルパ（SmolVLA と同じ想定）
+        # ACTION 以外の履歴をキューに詰めたい場合のためのヘルパ
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         actions = self._get_action_chunk(batch, noise)
@@ -355,7 +350,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
         """環境からの観測に対して 1 ステップ分のアクションを返す。
 
         内部では n_action_steps 分のアクションを一括でサンプルしてキューに溜め、
-        1 ステップずつ取り出す（SmolVLA と同じ動作）。
+        1 ステップずつ取り出す。
         """
         self.eval()
         batch = self._prepare_batch(batch)
@@ -459,6 +454,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
 
         for key in present_img_keys:
             x = batch[key]  # 期待: [B, T, C, H, W] or [B, C, H, W]
+            # print(f"Preparing image feature '{key}' with shape {x.shape}")
 
             if x.ndim == 4:
                 # [B, C, H, W] → [B, 1, C, H, W] として扱う

@@ -102,6 +102,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     elif name == "smolvla":
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
         
+        return SmolVLAPolicy
+        
     elif name == "cotvla":
         from lerobot.policies.cotvla.modeling_cotvla import CoTVLAPolicy
 

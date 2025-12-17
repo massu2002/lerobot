@@ -8,6 +8,7 @@ from . import gaussian_diffusion as gd
 from .respace import FMDiffusion, space_timesteps
 import torch
 from torch import nn
+from typing import Optional
 
 # Create model sizes of ActionModels
 def DiT_S(**kwargs):
@@ -170,3 +171,78 @@ class ActionModelFM(nn.Module):
             # rescale_timesteps=rescale_timesteps,
         )
         return self.ddim_diffusion
+    
+    # --------------------------------------------------
+    # (B, n_action_steps, action_dim) をサンプリングする関数
+    # --------------------------------------------------
+    @torch.no_grad()
+    def sample(
+        self,
+        z: torch.Tensor,
+        n_action_steps: int,
+        action_dim: int,
+        use_ddim: bool = False,
+        ddim_step: int = 10,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """
+        条件ベクトル z から、(B, n_action_steps, action_dim) の行動列をサンプリングする。
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            条件テンソル。形状 [B, D] を想定。
+        n_action_steps : int
+            予測したいステップ数 (T)。
+        action_dim : int
+            各ステップの行動次元数 (C)。
+        use_ddim : bool, default False
+            True の場合は DDIM サンプラーを使用。
+        ddim_step : int, default 10
+            DDIM のステップ数。use_ddim=True のときのみ使用。
+        device : torch.device, optional
+            サンプリングに使う device。None の場合は z.device を使用。
+
+        Returns
+        -------
+        actions : torch.Tensor
+            形状 [B, n_action_steps, action_dim] の行動列。
+        """
+        if device is None:
+            device = z.device
+
+        B = z.size(0)
+        shape = (B, n_action_steps, action_dim)
+
+        # 条件をネットワークのフォーマットに合わせる
+        # loss() と同様に [B, 1, D] にして渡す
+        z = z.to(device)
+        z_seq = z.unsqueeze(1)  # [B, 1, D]
+
+        # 使用する拡散オブジェクトを選択
+        if use_ddim:
+            if self.ddim_diffusion is None:
+                self.create_ddim(ddim_step=ddim_step)
+            diffusion = self.ddim_diffusion
+        else:
+            diffusion = self.diffusion
+
+        # diffusion.p_sample_loop 用のラッパーモデル
+        def model_fn(x_t, t, **kwargs):
+            # x_t: [B, T, C], t: [B] or [1]
+            return self.net(x_t, t, z_seq)
+
+        # 初期ノイズ
+        noise = torch.randn(shape, device=device)
+
+        # DDPM / DDIM サンプルループ
+        samples = diffusion.p_sample_loop(
+            model_fn,
+            shape,
+            noise=noise,
+            device=device,
+        )  # 形状 [B, n_action_steps, action_dim]
+
+        # そのまま「行動」として返す
+        actions = samples
+        return actions

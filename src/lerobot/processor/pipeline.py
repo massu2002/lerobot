@@ -1451,24 +1451,47 @@ class ObservationProcessorStep(ProcessorStep, ABC):
         """
         ...
 
+    # def __call__(self, transition: EnvTransition) -> EnvTransition:
+    #     """Applies the `observation` method to the transition's observation."""
+    #     self._current_transition = transition.copy()
+    #     new_transition = self._current_transition
+
+    #     observation = new_transition.get(TransitionKey.OBSERVATION)
+    #     if observation is None or not isinstance(observation, dict):
+    #         raise ValueError("ObservationProcessorStep requires an observation in the transition.")
+
+    #     processed_observation = self.observation(observation.copy())
+    #     new_transition[TransitionKey.OBSERVATION] = processed_observation
+        
+    #     future_observation = new_transition.get(TransitionKey.FUTURE_OBSERVATION)
+    #     if future_observation is None or not isinstance(future_observation, dict):
+    #         raise ValueError("ObservationProcessorStep requires a future_observation in the transition.")
+        
+    #     processed_future_observation = self.observation(future_observation.copy())
+    #     new_transition[TransitionKey.FUTURE_OBSERVATION] = processed_future_observation
+
+    #     return new_transition
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """Applies the `observation` method to the transition's observation."""
         self._current_transition = transition.copy()
         new_transition = self._current_transition
 
+        # --- observation の処理 ---
         observation = new_transition.get(TransitionKey.OBSERVATION)
         if observation is None or not isinstance(observation, dict):
             raise ValueError("ObservationProcessorStep requires an observation in the transition.")
 
         processed_observation = self.observation(observation.copy())
         new_transition[TransitionKey.OBSERVATION] = processed_observation
-        
+
+        # --- future_observation の処理（存在する場合のみ） ---
         future_observation = new_transition.get(TransitionKey.FUTURE_OBSERVATION)
-        if future_observation is None or not isinstance(future_observation, dict):
-            raise ValueError("ObservationProcessorStep requires a future_observation in the transition.")
-        
-        processed_future_observation = self.observation(future_observation.copy())
-        new_transition[TransitionKey.FUTURE_OBSERVATION] = processed_future_observation
+        if isinstance(future_observation, dict):
+            processed_future_observation = self.observation(future_observation.copy())
+            new_transition[TransitionKey.FUTURE_OBSERVATION] = processed_future_observation
+        else:
+            # 存在しない場合はスキップ（必要ならログ出力や警告も可）
+            pass
 
         return new_transition
 

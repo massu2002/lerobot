@@ -77,6 +77,9 @@ class CoTVLAConfig(PreTrainedConfig):
     # ======================
     # 3. CoT-VLA モデル構造
     # ======================
+    
+    # Visual CoT 関連
+    patch_size: int = 16
     obs_pred: bool = True  # Visual CoT を使うかどうか
 
     # シーケンス / トークン関連
@@ -84,10 +87,8 @@ class CoTVLAConfig(PreTrainedConfig):
     mask_l_obs_ratio: float = 0.0
     num_resampler_query: int = 9
     num_obs_token_per_image: int = 9
-    share_query: bool = False
 
     # ViT / DiT
-    use_dinosiglip: bool = False
     vit_checkpoint_path: Optional[str] = "./checkpoints/mae/mae_pretrain_vit_base.pth"
 
     # GPT-2 / Transformer 側
@@ -96,9 +97,6 @@ class CoTVLAConfig(PreTrainedConfig):
     transformer_heads: int = 12
     use_gpt2_pretrained: bool = True
     attn_implementation: str = "eager"
-    
-    # Action Decoder
-    use_dit_head: bool = False
 
     # ======================
     # 4. アテンション / 条件付けフラグ
@@ -109,9 +107,6 @@ class CoTVLAConfig(PreTrainedConfig):
     attn_robot_proprio_state: bool = False
     atten_goal: int = 0
     atten_goal_state: bool = False
-    
-    # obs prediction
-    patch_size: int = 16
 
     # ======================
     # 5. 損失関数関連

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+from peft import LoraConfig, get_peft_model, TaskType
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -588,6 +589,65 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
+    
+    def enable_lora(
+        self,
+        r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        bias: str = "none",
+        target: str = "both",  # "paligemma" | "expert" | "both"
+        freeze_vision: bool = True,
+    ):
+        """
+        Attach LoRA to:
+        - self.paligemma_with_expert.paligemma.language_model
+        - self.paligemma_with_expert.gemma_expert.model
+        using FEATURE_EXTRACTION to avoid generation API requirements.
+        """
+
+        def wrap_with_lora(m: nn.Module) -> nn.Module:
+            # freeze base
+            for p in m.parameters():
+                p.requires_grad = False
+
+            lora_cfg = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,  # important (GemmaModel has no prepare_inputs_for_generation)
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bias=bias,
+                target_modules=[
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ],
+            )
+            m = get_peft_model(m, lora_cfg)
+            try:
+                m.print_trainable_parameters()
+            except Exception:
+                pass
+            return m
+
+        if target in ("paligemma", "both"):
+            self.paligemma_with_expert.paligemma.language_model = wrap_with_lora(
+                self.paligemma_with_expert.paligemma.language_model
+            )
+
+        if target in ("expert", "both"):
+            self.paligemma_with_expert.gemma_expert.model = wrap_with_lora(
+                self.paligemma_with_expert.gemma_expert.model
+            )
+            
+        if freeze_vision:
+            # どちらのパスでも当たるように
+            if hasattr(self.paligemma_with_expert.paligemma, "vision_tower"):
+                vt = self.paligemma_with_expert.paligemma.vision_tower
+            else:
+                vt = self.paligemma_with_expert.paligemma.model.vision_tower
+
+            for p in vt.parameters():
+                p.requires_grad = False
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -870,6 +930,9 @@ class PI0Policy(PreTrainedPolicy):
 
         # Initialize the core PI0 model
         self.model = PI0Pytorch(config)
+        self.model.enable_lora(r=16, lora_alpha=32, lora_dropout=0.05, target="both")
+        any_lora = any("lora" in n for n, _ in self.model.named_parameters())
+        # print("LoRA inserted:", any_lora)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1100,6 +1163,10 @@ class PI0Policy(PreTrainedPolicy):
 
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
+                # img: [B, T, C, H, W] の場合、T の先頭だけ使う
+                if img.dim() == 5:
+                    # [B, T, C, H, W] -> [B, C, H, W]
+                    img = img[:, 0]
                 img = resize_with_pad_torch(img, *self.config.image_resolution)
 
             # Normalize from [0,1] to [-1,1] as expected by siglip
@@ -1127,6 +1194,9 @@ class PI0Policy(PreTrainedPolicy):
     def prepare_state(self, batch):
         """Pad state"""
         state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
+        print("Prepared State Shape (before dim check):", state.shape)
+        if state.dim() == 3:
+            state = state.squeeze(1)
         return state
 
     def prepare_action(self, batch):
