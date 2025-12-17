@@ -189,3 +189,9 @@ checkpoints/
 *.pth
 *.pt
 *.ckpt
+
+# Large checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
