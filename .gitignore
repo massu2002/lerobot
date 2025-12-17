@@ -183,3 +183,9 @@ smolvla_base/
 *.part
 
 
+
+# checkpoints (large)
+checkpoints/
+*.pth
+*.pt
+*.ckpt
