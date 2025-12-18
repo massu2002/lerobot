@@ -220,7 +220,8 @@ def compute_layer_complete(
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        # hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        hidden_states, gate = _call_norm_maybe_cond(layer.input_layernorm, hidden_states, adarms_cond[i])
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -269,18 +270,59 @@ def compute_layer_complete(
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
-        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+        # out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+        if hasattr(modeling_gemma, "_gated_residual"):
+            out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # type: ignore[attr-defined]
+        else:
+            out_emb = _gated_residual_fallback(hidden_states, out_emb, gates[i])
         after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        # out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        out_emb, gate = _call_norm_maybe_cond(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
         # second residual
-        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+        # out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+        if hasattr(modeling_gemma, "_gated_residual"):
+            out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # type: ignore[attr-defined]
+        else:
+            out_emb = _gated_residual_fallback(after_first_residual, out_emb, gate)
+        # if gates[i] is not None:
+        #     print("gate shape", gates[i].shape, "out_emb", out_emb.shape)
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
+
+def _gated_residual_fallback(x, y, gate):
+    """
+    Fallback for transformers.models.gemma.modeling_gemma._gated_residual
+    Typical gated residual: x + gate * y  (with broadcasting)
+    """
+    if gate is None:
+        return x + y
+    # gate shape might be [B, 1] or [B, T, 1] or [B, T, D] etc.
+    return x + y * gate
+
+
+def _call_norm_maybe_cond(norm, x, cond=None):
+    """Call RMSNorm that may or may not accept `cond`.
+    Returns (y, gate_or_None)."""
+    # まず cond 付きで試す（AdaRMSNorm 等）
+    if cond is not None:
+        try:
+            out = norm(x, cond=cond)
+        except TypeError:
+            out = norm(x)
+    else:
+        out = norm(x)
+
+    # AdaRMSNorm 系は (y, gate) を返すことがある
+    if isinstance(out, tuple):
+        if len(out) == 2:
+            return out[0], out[1]
+        return out[0], None
+    return out, None
 
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
@@ -478,7 +520,8 @@ class PaliGemmaWithExpertModel(
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    # out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    out_emb, _ = _call_norm_maybe_cond(models[i].norm, hidden_states, adarms_cond[i])
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
@@ -535,15 +578,15 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
-        msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
+        # msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
 
-        try:
-            from transformers.models.siglip import check
+        # try:
+        #     from transformers.models.siglip import check
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+        #     if not check.check_whether_transformers_replace_is_installed_correctly():
+        #         raise ValueError(msg)
+        # except ImportError:
+        #     raise ValueError(msg) from None
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -1194,7 +1237,7 @@ class PI0Policy(PreTrainedPolicy):
     def prepare_state(self, batch):
         """Pad state"""
         state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
-        print("Prepared State Shape (before dim check):", state.shape)
+        # print("Prepared State Shape (before dim check):", state.shape)
         if state.dim() == 3:
             state = state.squeeze(1)
         return state

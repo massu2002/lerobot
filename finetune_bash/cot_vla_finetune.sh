@@ -2,7 +2,7 @@
 export HF_LEROBOT_HOME="/home/masuoka/lerobot/finetune_dataset"
 
 # 事前学習データセット設定
-dataset_name="task_1"
+dataset_name="task_2"
 repo_id="${HF_LEROBOT_HOME}/${dataset_name}"
 job_name="cotvla_${dataset_name}"
 
@@ -23,10 +23,10 @@ seed=42
 
 # 実行（事前学習あり）
 lerobot-train \
-  --policy.path=./outputs/cotvla/pretraindata_v1_visual_cot/weight_${img_recon_loss_weight}/seed_42/checkpoints/050000/pretrained_model \
+  --policy.path=../outputs/cotvla/pretraindata_v1_visual_cot/weight_${img_recon_loss_weight}/seed_42/checkpoints/050000/pretrained_model \
   --dataset.repo_id=${repo_id} \
   --dataset.video_backend=pyav \
-  --output_dir=./outputs/cotvla_${img_recon_loss_weight}/${dataset_name}/seed_${seed} \
+  --output_dir=../outputs/cotvla_${img_recon_loss_weight}/${dataset_name}/seed_${seed} \
   --policy.phase=${phase} \
   --policy.obs_pred=${obs_pred} \
   --policy.img_recon_loss_weight=${img_recon_loss_weight} \

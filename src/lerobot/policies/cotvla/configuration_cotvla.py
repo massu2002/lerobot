@@ -89,7 +89,7 @@ class CoTVLAConfig(PreTrainedConfig):
     num_obs_token_per_image: int = 9
 
     # ViT / DiT
-    vit_checkpoint_path: Optional[str] = "./checkpoints/mae/mae_pretrain_vit_base.pth"
+    vit_checkpoint_path: Optional[str] = "../checkpoints/mae/mae_pretrain_vit_base.pth"
 
     # GPT-2 / Transformer 側
     transformer_layers: int = 12
