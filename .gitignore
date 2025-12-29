@@ -197,3 +197,5 @@ checkpoints/
 *.pth
 *.pt
 *.ckpt
+core
+core.*
