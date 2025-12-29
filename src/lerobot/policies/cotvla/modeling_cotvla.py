@@ -321,6 +321,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        state = state.unsqueeze(1)  # (B, 1, state_dim)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
@@ -332,7 +333,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
             text_token=lang_tokens,
             text_attn=lang_masks,
             mode="inference",
-            future_image_primary=images[2],
+            future_image_primary=images[2] if len(images) > 2 else None,
             future_image_wrist=images[3] if len(images) > 3 else None,
         )
         actions = arm_pred_action  # (B, n_action_steps, action_dim)
@@ -441,8 +442,8 @@ class CoTVLAPolicy(PreTrainedPolicy):
             text_attn=lang_masks,
             action_label=actions,
             mode="train",
-            future_image_primary=images[2],
-            future_image_wrist=images[3],
+            future_image_primary=images[2] if len(images) > 2 else None,
+            future_image_wrist=images[3] if len(images) > 3 else None,
             masks_dict=masks_dict if len(masks_dict) > 0 else None,
         )
         

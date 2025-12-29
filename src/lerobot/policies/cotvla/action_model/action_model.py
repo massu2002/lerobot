@@ -84,6 +84,110 @@ class ActionModel(nn.Module):
                                                learn_sigma = False
                                                )
         return self.ddim_diffusion
+
+    @torch.no_grad()
+    def sample(
+        self,
+        z: torch.Tensor,
+        n_action_steps: int,
+        action_dim: int,
+        use_ddim: bool = True,
+        ddim_step: int = 10,
+        device=None,
+        x_T: torch.Tensor | None = None,
+        clip_denoised: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            z: condition embedding [B, D]
+            n_action_steps: T
+            action_dim: C
+            use_ddim: DDIM sampling if True else ancestral sampling
+            ddim_step: number of DDIM steps
+            device: sampling device (default: z.device)
+            x_T: optional initial noise [B, T, C]
+            clip_denoised: whether to clip predicted x0 (if diffusion supports)
+
+        Returns:
+            x_0: sampled action tokens [B, T, C]
+        """
+        if device is None:
+            device = z.device
+
+        B = z.shape[0]
+        z_seq = z.to(device).unsqueeze(1)  # [B, 1, D]
+
+        # initial noise
+        if x_T is None:
+            x = torch.randn(B, n_action_steps, action_dim, device=device)
+        else:
+            x = x_T.to(device)
+            assert x.shape == (B, n_action_steps, action_dim), f"x_T.shape={x.shape}"
+
+        # pick diffusion object
+        diff = self.diffusion
+        if use_ddim:
+            if (self.ddim_diffusion is None) or (getattr(self.ddim_diffusion, "timestep_respacing", None) != "ddim" + str(ddim_step)):
+                diff = self.create_ddim(ddim_step=ddim_step)
+            else:
+                diff = self.ddim_diffusion
+
+        # time indices (descending)
+        # create_diffusion("ddimK") usually changes num_timesteps to K.
+        timesteps = list(range(diff.num_timesteps))[::-1]
+
+        for t in timesteps:
+            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+
+            # predict eps (noise)
+            eps = self.net(x, t_batch, z_seq)  # [B, T, C]
+
+            # --- Update rule ---
+            # Prefer diffusion helper APIs if available. Many diffusion libs provide:
+            #  - p_sample(...) for ancestral
+            #  - ddim_sample(...) for DDIM
+            if use_ddim and hasattr(diff, "ddim_sample"):
+                out = diff.ddim_sample(
+                    model=lambda _x, _t, **kw: self.net(_x, _t, z_seq),
+                    x=x,
+                    t=t_batch,
+                    clip_denoised=clip_denoised,
+                )
+                # common conventions: dict with "sample" key
+                x = out["sample"] if isinstance(out, dict) and "sample" in out else out
+            elif (not use_ddim) and hasattr(diff, "p_sample"):
+                out = diff.p_sample(
+                    model=lambda _x, _t, **kw: self.net(_x, _t, z_seq),
+                    x=x,
+                    t=t_batch,
+                    clip_denoised=clip_denoised,
+                )
+                x = out["sample"] if isinstance(out, dict) and "sample" in out else out
+            else:
+                # Fallback: implement DDIM-like step using predicted eps
+                # (This branch is only used if your diffusion object lacks helpers.)
+                # We need alphas_cumprod etc. Many libs expose them as arrays/tensors.
+                alphas_cumprod = torch.as_tensor(diff.alphas_cumprod, device=device, dtype=x.dtype)
+                if t == 0:
+                    alpha_bar_prev = torch.ones((), device=device, dtype=x.dtype)
+                else:
+                    alpha_bar_prev = alphas_cumprod[t - 1]
+                alpha_bar = alphas_cumprod[t]
+
+                # x0 estimate
+                x0 = (x - (1 - alpha_bar).sqrt() * eps) / alpha_bar.sqrt()
+                if clip_denoised:
+                    x0 = x0.clamp(-1.0, 1.0)
+
+                if use_ddim:
+                    # deterministic DDIM (eta=0)
+                    x = alpha_bar_prev.sqrt() * x0 + (1 - alpha_bar_prev).sqrt() * eps
+                else:
+                    # ancestral-ish: add noise (simple)
+                    noise = torch.randn_like(x) if t > 0 else 0.0
+                    x = alpha_bar_prev.sqrt() * x0 + (1 - alpha_bar_prev).sqrt() * eps + 0.0 * noise
+
+        return x
     
     
 class ActionModelFM(nn.Module):
