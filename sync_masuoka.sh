@@ -98,3 +98,7 @@ echo "DONE ✅"
 echo "Train repo : ${REPO_ROOT} (${BRANCH})"
 echo "Eval repo  : ${EVAL_WORKTREE_PATH} (tag ${TAG_NAME})"
 echo "Tip: run inference from '${EVAL_WORKTREE_PATH}'"
+
+
+# Example usage:
+# TAG_NAME=eval-20260101 ./sync_masuoka.sh
