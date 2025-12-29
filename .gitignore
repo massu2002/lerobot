@@ -193,7 +193,7 @@ checkpoints/
 *.ckpt
 
 # Large checkpoints
-checkpoints/
+vla_models/
 *.pth
 *.pt
 *.ckpt
