@@ -7,6 +7,7 @@ HF_USER=atsuto-1
 
 task_number=1
 model_type=vanilla_vla
+sub_model_type=cotvla
 
 declare -A TASKS=(
   [1]="put the green block in the white box"
@@ -37,5 +38,5 @@ lerobot-record \
     --dataset.episode_time_s=40 \
     --dataset.single_task="$TASK_PROMPT" \
     --policy.path=../vla_models/task_${task_number}/${model_type}/pretrained_model \
-    --model_type=${model_type} \
+    --model_type=${sub_model_type} \
     --resume=True
