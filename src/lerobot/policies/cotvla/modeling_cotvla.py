@@ -52,11 +52,12 @@ policy = cotvlaPolicy.from_pretrained("lerobot/cotvla_base")
 
 import math
 from collections import deque
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
+from termcolor import colored
 import torch
 import torch.nn.functional as F  # noqa: N812
-from torch import Tensor, nn
+from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.cotvla.configuration_cotvla import CoTVLAConfig
@@ -142,6 +143,36 @@ def resize_with_pad(img, width, height, pad_value=-1):
     # pad on left and top of image
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
     return padded_img
+
+
+def resize_with_pad_mask(mask, width, height):
+    """
+    mask: [B, 1, H, W]  (float / uint8 / bool OK)
+    return: [B, 1, height, width]
+    """
+    if mask.ndim != 4:
+        raise ValueError(f"(b,1,h,w) expected, but {mask.shape}")
+
+    cur_height, cur_width = mask.shape[2:]
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+
+    # ★ nearest に変更
+    resized_mask = F.interpolate(
+        mask.float(),
+        size=(resized_height, resized_width),
+        mode="nearest",
+    )
+
+    pad_height = max(0, int(height - resized_height))
+    pad_width = max(0, int(width - resized_width))
+
+    # ★ pad_value = 0
+    padded_mask = F.pad(resized_mask, (pad_width, 0, pad_height, 0), value=0.0)
+
+    return padded_mask
 
 
 def pad_vector(vector, new_dim):
@@ -257,9 +288,9 @@ class CoTVLAPolicy(PreTrainedPolicy):
             use_gpt2_pretrained=config.use_gpt2_pretrained,
             attn_implementation=config.attn_implementation,
             obs_pred=config.obs_pred,
+            use_sam_mask_loss=config.use_sam_mask_loss,
         )
         self.model.to(config.device)
-
         self.reset()
 
     # ------------------------------------------------------------------
@@ -284,6 +315,9 @@ class CoTVLAPolicy(PreTrainedPolicy):
         noise: Optional[Tensor] = None,
     ) -> Tensor:
         """(B, T, ·) のバッチから (B, n_action_steps, action_dim) のアクション列を生成。"""
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
@@ -384,6 +418,12 @@ class CoTVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
+        if self.config.mask_keys != []:
+            masks_dict, pad_dict, mask_keys = self.prepare_masks_multiclass_dict(batch)
+        else:
+            masks_dict = {}
+            pad_dict = {}
+            mask_keys = []
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
@@ -402,31 +442,51 @@ class CoTVLAPolicy(PreTrainedPolicy):
             action_label=actions,
             mode="train",
             future_image_primary=images[2],
-            future_image_wrist=images[3] if len(images) > 3 else None,
+            future_image_wrist=images[3],
+            masks_dict=masks_dict if len(masks_dict) > 0 else None,
         )
+        
+        # 総合損失を計算
         if image_recon_error is not None:
-            img_recon_scalar = image_recon_error["batch_mse"]
+            img_recon_scalar = image_recon_error["all_batch_mse"]
             losses = loss_arm_action + self.config.img_recon_loss_weight * img_recon_scalar
         else:
             losses = loss_arm_action
-        loss_dict["losses_after_forward"] = losses.clone()
+            
+        if image_recon_error is not None and mask_keys is not None and len(mask_keys) > 0:
+            class_map = self.build_mask_class_map(mask_keys)  # 例: {"block":1,"robot":2,...}
+
+            # まず all を既存キーで保持
+            loss_dict["image_recon_error/all_batch_mse"] = image_recon_error.get(
+                "all_batch_mse",
+                torch.tensor(0.0, device=loss_arm_action.device),
+            )
+
+            # mask_key -> class_id -> image_recon_error["label_{id}_batch_mse"]
+            for mk, cid in class_map.items():
+                k = f"label_{cid}_batch_mse"
+                v = image_recon_error.get(k, None)
+
+                # 無い場合（そのラベルがそのbatchに存在しない等）は 0 で埋める
+                if v is None:
+                    v = torch.tensor(0.0, device=loss_arm_action.device)
+
+                # loss_dict へ（ログしやすいキー名にする）
+                loss_dict[f"image_recon_error/{mk}_batch_mse"] = v
+                # print(f"[Visual CoT] label {mk} (class_id={cid}) recon batch_mse: {v.item():.6f}")
+            # print(f"[Visual CoT] total recon batch_mse: {loss_dict['image_recon_error/all_batch_mse'].item():.6f}")
+
+        else:
+            # image_recon_error が無い場合もキーは作っておくとログが安定する
+            loss_dict["image_recon_error/all_batch_mse"] = torch.tensor(0.0, device=loss_arm_action.device)
         
-        loss_dict["image_recon_error"] = image_recon_error["batch_mse"] if image_recon_error is not None else torch.tensor(0.0)
+        # アクション予測誤差
         loss_dict["action_loss"] = loss_arm_action
 
-        # エピソード外パディングを無視
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad  # True = 有効ステップ
-            losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone()
-
-        # action 次元のパディングを除去
-        loss_dict["losses_after_rm_padding"] = losses.clone()
-
-        # scalar loss
+        # 最終的な平均化
         loss = losses.mean()
-        loss_dict["loss"] = loss
-
+        loss_dict["loss"] = loss.item()
+        
         return loss, loss_dict
 
     # ------------------------------------------------------------------
@@ -435,7 +495,7 @@ class CoTVLAPolicy(PreTrainedPolicy):
     def prepare_images(self, batch: Dict[str, Tensor]):
         """CoTVLA 用の画像前処理。
 
-        - (B, T, C, H, W) の場合は **全フレーム T を使用**（CoTVLA 仕様）
+        - (B, T, C, H, W) の場合は **全フレーム T を使用**(CoTVLA 仕様)
         - (B, C, H, W) の場合は T=1 として扱う
         - 必要ならリサイズ＋パディングでアスペクト保持
         - [0, 1] → [-1, 1] にスケーリング
@@ -503,6 +563,143 @@ class CoTVLAPolicy(PreTrainedPolicy):
             img_masks.append(mask)
 
         return images, img_masks
+    
+    def build_mask_class_map(self, mask_keys: list[str]) -> dict[str, int]:
+        # 0 は背景固定、1..K を mask_key に割り当て
+        return {mk: i + 1 for i, mk in enumerate(mask_keys)}
+    
+    def extract_mask_key(self, feature_key: str) -> str:
+        # 例: "observation.images.front/mask/sam" -> "sam"
+        parts = feature_key.split("/mask/")
+        if len(parts) != 2:
+            raise ValueError(f"feature key does not contain '/mask/': {feature_key}")
+        return parts[1]
+    
+    def _to_bt1hw(self, m: Tensor) -> Tuple[Tensor, int, int, int, int]:
+        """
+        任意形状の mask を [B,T,1,H,W] に正規化して返す（値はそのまま）
+        対応:
+        [B,H,W]
+        [B,1,H,W]
+        [B,T,H,W]
+        [B,T,1,H,W]
+        [B,T,N,H,W] -> ここでは OR 合成して [B,T,1,H,W] にする（必要なら別処理）
+        """
+        if m.ndim == 3:
+            m = m.unsqueeze(1).unsqueeze(2)          # [B,1,1,H,W]
+        elif m.ndim == 4:
+            if m.shape[1] == 1:
+                m = m.unsqueeze(1)                   # [B,1,1,H,W]
+            else:
+                m = m.unsqueeze(2)                   # [B,T,1,H,W]
+        elif m.ndim == 5:
+            pass
+        else:
+            raise ValueError(f"mask must be 3D/4D/5D, got {m.shape}")
+
+        B, T, K, H, W = m.shape
+        if K != 1:
+            m = (m > 0).any(dim=2, keepdim=True)     # [B,T,1,H,W]
+        return m, B, T, H, W
+
+
+    def prepare_masks_multiclass_dict(self, batch: Dict[str, Tensor])-> Tuple[Dict[str, Tensor], Dict[str, Tensor], List[str]]:
+        """
+        <mask_key> ごとに class_id を割り当て、多クラスラベルマップとして統合して返す。
+        出力は dict。
+
+        返り値:
+        masks_dict[cam] = [B,T,1,H',W'] int64 (0=bg, 1..K=class)
+        pad_dict[cam]   = [B,T] bool
+        """
+        # 例: ["observation.images.front/mask/sam", ...]
+        feat_keys = list(self.config.mask_features)
+
+        if len(feat_keys) == 0:
+            return {}, {}, []
+
+        # cam ごとに feature keys を束ねる
+        cam_to_feats: Dict[str, list[str]] = {}
+        for k in feat_keys:
+            # cam を "observation.images.front" のように取りたい
+            if "/mask/" not in k:
+                continue
+            cam = k.split("/mask/")[0]  # "observation.images.front"
+            import logging
+            cam_to_feats.setdefault(cam, []).append(k)
+
+        if len(cam_to_feats) == 0:
+            raise ValueError(f"No mask feature keys with '/mask/' found: {feat_keys}")
+
+        # mask_key -> class_id（固定）
+        # self.mask_keys を持ってるならそれを使うのが一番確実
+        mask_keys = getattr(self, "mask_keys", None)
+        if mask_keys is None or len(mask_keys) == 0:
+            # feature keys から抽出して作る
+            mask_keys = sorted({self.extract_mask_key(k) for k in feat_keys})
+        class_map = getattr(self, "mask_class_map", None)
+        if class_map is None:
+            class_map = self.build_mask_class_map(mask_keys)
+            self.mask_class_map = class_map
+
+        masks_dict: Dict[str, Tensor] = {}
+        pad_dict: Dict[str, Tensor] = {}
+
+        for cam, keys in cam_to_feats.items():
+            # この cam に属する mask が1つも batch に無いならエラー（スキップにしたければここを変更）
+            present = [k for k in keys if k in batch]
+            if len(present) == 0:
+                raise ValueError(f"All mask features for cam '{cam}' are missing from batch. expected={keys}")
+
+            # 基準 shape を最初の present から決める
+            m0, B, T, H, W = self._to_bt1hw(batch[present[0]])
+
+            # ラベルマップ初期化（0=bg）
+            label = torch.zeros((B, T, 1, H, W), dtype=torch.int64, device=m0.device)
+
+            # padding mask（なければ全True）
+            pad_key0 = f"{present[0]}_padding_mask"
+            if pad_key0 in batch:
+                pm = batch[pad_key0].bool()
+                if pm.ndim == 1:
+                    pm = pm.unsqueeze(1).expand(B, T)
+            else:
+                pm = torch.ones((B, T), dtype=torch.bool, device=m0.device)
+
+            # 各 mask_key を class_id で塗る（重なりは後勝ち）
+            for k in present:
+                mk = self.extract_mask_key(k)          # "sam"
+                cid = int(class_map.get(mk, 0))   # 未登録なら0
+                if cid <= 0:
+                    continue
+
+                m, B2, T2, H2, W2 = self._to_bt1hw(batch[k])
+                if (B2, T2, H2, W2) != (B, T, H, W):
+                    raise ValueError(f"Shape mismatch among masks for cam={cam}: base={(B,T,H,W)} vs {k}={(B2,T2,H2,W2)}")
+
+                on = (m > 0)  # bool [B,T,1,H,W]
+                label = torch.where(on, torch.full_like(label, cid), label)
+
+                # padding_mask が mask ごとにあるなら AND で統合したい場合（任意）
+                pk = f"{k}_padding_mask"
+                if pk in batch:
+                    pm_k = batch[pk].bool()
+                    if pm_k.ndim == 1:
+                        pm_k = pm_k.unsqueeze(1).expand(B, T)
+                    pm = pm & pm_k
+
+            # resize+pad（nearest）
+            if getattr(self.config, "resize_imgs_with_padding", None) is not None:
+                rh, rw = self.config.resize_imgs_with_padding
+                label_flat = label.reshape(B * T, 1, H, W).float()  # interpolateのため float
+                label_flat = resize_with_pad_mask(label_flat, rw, rh)  # nearest+pad0 のやつ
+                label = label_flat.reshape(B, T, 1, rh, rw).to(torch.int64)
+
+            masks_dict[cam] = label      # camごとの多クラス
+            pad_dict[cam] = pm
+            # print(f"[Visual CoT] prepared mask for cam '{cam}': classes={keys}, shape={label.shape}, pad_shape={pm.shape}")
+
+        return masks_dict, pad_dict, mask_keys
 
     def prepare_state(self, batch: Dict[str, Tensor]) -> Tensor:
         """ロボット状態ベクトルをパディングして固定長に揃える。"""

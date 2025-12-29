@@ -13,11 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import csv
 import logging
+import os
+import json
+import numpy as np
 import random
 import time
 from contextlib import nullcontext
 from pprint import pformat
+import torch.distributed as dist
 from typing import Any, Mapping, Sequence, List, Dict
 
 import torch
@@ -145,6 +150,16 @@ class SequenceLeRobotDataset(Dataset):
         # 取りうる開始 idx の総数
         # 例: base_len=100, window_size=12 → 0〜88 までの 89 通り
         self.length = max(0, self.num_transitions - self.window_size + 1)
+        
+        # base_dataset 側で定義されている mask_keys を参照（例: ["sam", "hand", ...]）
+        self.mask_keys = getattr(base_dataset, "mask_keys", [])
+
+        # 期待するマスクのフラットキー（LeRobotDataset.__getitem__ がこれを返す想定）
+        self.required_mask_keys = []
+        for cam in ["observation.images.front", "observation.images.wrist"]:
+            for mk in self.mask_keys:
+                self.required_mask_keys.append(f"{cam}/mask/{mk}")
+
 
     def __len__(self) -> int:
         return self.length
@@ -170,28 +185,30 @@ class SequenceLeRobotDataset(Dataset):
         # str, float, int, None などは最後の値だけ使う
         return frames_values[-1]
 
-    @staticmethod
-    def _is_invalid_frame(frame: Dict[str, Any]) -> bool:
-        """
-        どちらかのカメラの画像が NaN / 無い場合は True を返す。
-
-        frame はフラットな dict で、
-        'observation.images.front', 'observation.images.wrist' などのキーを持っている前提。
-        """
-        # 必須カメラのキー名（環境に合わせて調整してOK）
-        required_keys = [
+    def _is_invalid_frame(self, frame: Dict[str, Any]) -> bool:
+        required_img_keys = [
             "observation.images.front",
             "observation.images.wrist",
         ]
 
-        for key in required_keys:
+        # 画像チェック
+        for key in required_img_keys:
             if key not in frame:
-                # そもそもこのカメラの画像が無い
                 return True
             img = frame[key]
             if isinstance(img, torch.Tensor) and torch.isnan(img).any():
-                # 画像テンソル内に NaN がある場合も NG
                 return True
+
+        # マスクチェック（mask_keys がある場合のみ）
+        if hasattr(self, "required_mask_keys"):
+            for mkey in self.required_mask_keys:
+                if mkey not in frame:
+                    return True
+                m = frame[mkey]
+                if not isinstance(m, torch.Tensor):
+                    return True
+                if torch.isnan(m.float()).any():
+                    return True
 
         return False
 
@@ -230,6 +247,17 @@ class SequenceLeRobotDataset(Dataset):
                 if torch.is_tensor(imgs[0]):
                     # [T_subgoal, C, H, W]
                     seq_sample[f"future_{cam_key}"] = torch.stack(imgs, dim=0)
+                    
+        # --- subgoal 観測マスク (future_.../mask/...) を追加 ---
+        if hasattr(self, "mask_keys") and len(self.mask_keys) > 0:
+            for cam_key in ["observation.images.front", "observation.images.wrist"]:
+                for mk in self.mask_keys:
+                    k = f"{cam_key}/mask/{mk}"
+                    if k in future_obs_frames[0]:
+                        ms = [f[k] for f in future_obs_frames]
+                        if torch.is_tensor(ms[0]):
+                            # [T_subgoal, H, W]
+                            seq_sample[f"future_{k}"] = torch.stack(ms, dim=0)
 
         # メタ情報
         seq_sample["index_start"] = idx
@@ -255,7 +283,7 @@ class SequenceLeRobotDataset(Dataset):
         original_idx = idx  # デバッグ用に保持
 
         for attempt in range(self.max_retry):
-            # 🔴 念のためガード（DataLoader のバグ混入や length 計算ミス検出用）
+            # 念のためガード（DataLoader のバグ混入や length 計算ミス検出用）
             if idx < 0 or idx + self.window_size > self.num_transitions:
                 # おかしな idx の場合はランダムに振り直して再試行
                 idx = random.randrange(self.length)
@@ -294,6 +322,34 @@ class SequenceLeRobotDataset(Dataset):
             f"Too many failed samples in SequenceLeRobotDataset.__getitem__ "
             f"(orig_idx={original_idx}, max_retry={self.max_retry})"
         )
+        
+def to_csv_cell(x):
+    # torch.Tensor
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+        if x.numel() == 1:
+            return float(x.item())
+        # 多要素は list 化して JSON で1セルに入れる
+        return json.dumps(x.tolist(), ensure_ascii=False)
+
+    # numpy
+    if isinstance(x, np.ndarray):
+        if x.size == 1:
+            return float(x.item())
+        return json.dumps(x.tolist(), ensure_ascii=False)
+
+    # python scalar
+    if isinstance(x, (int, float, bool, np.number)):
+        return float(x)
+
+    # list/tuple/dict は JSON 文字列で保存
+    if isinstance(x, (list, tuple, dict)):
+        return json.dumps(x, ensure_ascii=False)
+
+    # その他（例: None, str など）
+    if x is None:
+        return ""
+    return str(x)
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -533,6 +589,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             drop_n_last_frames=drop_n_last_frames,
             shuffle=True,
         )
+        print(f"Using EpisodeAwareSampler with drop_n_last_frames={drop_n_last_frames}")
     else:
         shuffle = True
         sampler = None
@@ -543,6 +600,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         batch_size=cfg.batch_size,
         shuffle=shuffle and not cfg.dataset.streaming and sampler is None,
         sampler=sampler,
+        timeout=60,
         pin_memory=True,
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
@@ -579,106 +637,135 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
+        
+    csv_path = os.path.join(cfg.output_dir, "train_output_log.csv")
+    csv_interval = 200
 
-    for _ in tqdm(range(step, cfg.steps), desc="Training steps", total=cfg.steps - step):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
+    try:
+        for _ in tqdm(range(step, cfg.steps), desc="Training steps", total=cfg.steps - step):
+            # print(f"=== Training step {step + 1} ===")
+            start_time = time.perf_counter()
+            batch = next(dl_iter)
+            # print(" Batch before preproc keys:", batch.keys())
+            batch = preprocessor(batch)
+            # print(" Batch keys:", batch.keys())
+            train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-        )
+            train_tracker, output_dict = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                lr_scheduler=lr_scheduler,
+            )
 
-        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
-        # increment `step` here.
-        step += 1
-        train_tracker.step()
-        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
-        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+            # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+            # increment `step` here.
+            step += 1
+            train_tracker.step()
+            is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+            is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+            
+            is_csv_step = step % csv_interval == 0 and is_main_process
+            
+            if is_csv_step:
+                row = {k: to_csv_cell(v) for k, v in output_dict.items()}
+                row["step"] = step
 
-        if is_log_step:
-            logging.info(train_tracker)
-            if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    wandb_log_dict.update(output_dict)
-                wandb_logger.log_dict(wandb_log_dict, step)
-            train_tracker.reset_averages()
+                write_header = not os.path.exists(csv_path)
 
-        if cfg.save_checkpoint and is_saving_step:
-            if is_main_process:
-                logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(policy),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                )
-                update_last_checkpoint(checkpoint_dir)
+                # 列順を安定させたい場合（おすすめ）
+                fieldnames = ["step"] + sorted([k for k in row.keys() if k != "step"])
+
+                with open(csv_path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(row)
+
+            if is_log_step:
+                logging.info(train_tracker)
                 if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+                    wandb_log_dict = train_tracker.to_dict()
+                    if output_dict:
+                        wandb_log_dict.update(output_dict)
+                    wandb_logger.log_dict(wandb_log_dict, step)
+                train_tracker.reset_averages()
 
-            accelerator.wait_for_everyone()
-
-        if cfg.env and is_eval_step:
-            if is_main_process:
-                step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Eval policy at step {step}")
-                with torch.no_grad(), accelerator.autocast():
-                    eval_info = eval_policy_all(
-                        envs=eval_env,  # dict[suite][task_id] -> vec_env
+            if cfg.save_checkpoint and is_saving_step:
+                if is_main_process:
+                    logging.info(f"Checkpoint policy after step {step}")
+                    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
                         policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
-                        n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                        max_parallel_tasks=cfg.env.max_parallel_tasks,
                     )
-                # overall metrics (suite-agnostic)
-                aggregated = eval_info["overall"]
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
 
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+                accelerator.wait_for_everyone()
 
-                # meters/tracker
-                eval_metrics = {
-                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
-                }
-                eval_tracker = MetricsTracker(
-                    cfg.batch_size,
-                    dataset.num_frames,
-                    dataset.num_episodes,
-                    eval_metrics,
-                    initial_step=step,
-                    accelerator=accelerator,
-                )
-                eval_tracker.eval_s = aggregated.pop("eval_s")
-                eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
-                eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+            if cfg.env and is_eval_step:
+                if is_main_process:
+                    step_id = get_step_identifier(step, cfg.steps)
+                    with torch.no_grad(), accelerator.autocast():
+                        eval_info = eval_policy_all(
+                            envs=eval_env,  # dict[suite][task_id] -> vec_env
+                            policy=accelerator.unwrap_model(policy),
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            n_episodes=cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=4,
+                            start_seed=cfg.seed,
+                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        )
+                    # overall metrics (suite-agnostic)
+                    aggregated = eval_info["overall"]
 
-            accelerator.wait_for_everyone()
+                    # optional: per-suite logging
+                    for suite, suite_info in eval_info.items():
+                        logging.info("Suite %s aggregated: %s", suite, suite_info)
+
+                    # meters/tracker
+                    eval_metrics = {
+                        "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                        "pc_success": AverageMeter("success", ":.1f"),
+                        "eval_s": AverageMeter("eval_s", ":.3f"),
+                    }
+                    eval_tracker = MetricsTracker(
+                        cfg.batch_size,
+                        dataset.num_frames,
+                        dataset.num_episodes,
+                        eval_metrics,
+                        initial_step=step,
+                        accelerator=accelerator,
+                    )
+                    eval_tracker.eval_s = aggregated.pop("eval_s")
+                    eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
+                    eval_tracker.pc_success = aggregated.pop("pc_success")
+                    if wandb_logger:
+                        wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                        wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                        wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+
+                accelerator.wait_for_everyone()
+    except Exception as e:
+        print("FATAL:", repr(e))
+        raise
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
     if eval_env:
         close_envs(eval_env)

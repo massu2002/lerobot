@@ -15,13 +15,17 @@
 # limitations under the License.
 import contextlib
 import logging
+import os
+from collections import defaultdict
 import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+import cv2
 from pyparsing import Dict
 import math
 import torch.nn.functional as F
+from functools import lru_cache
 
 import datasets
 import numpy as np
@@ -82,7 +86,8 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
 
-
+_LOAD_COUNT = defaultdict(int)
+ 
 class LeRobotDatasetMetadata:
     def __init__(
         self,
@@ -229,6 +234,35 @@ class LeRobotDatasetMetadata:
                                        chunk_index=chunk_idx, 
                                        file_index=file_idx)
         return Path(fpath)
+    
+    def get_mask_file_path(self, ep_index: int, vid_key: str, mask_key: str) -> Path | None:
+        if self.episodes is None:
+            self.episodes = load_episodes(self.root)
+        if ep_index >= len(self.episodes):
+            raise IndexError(
+                f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
+            )
+        ep = self.episodes[ep_index]
+        chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
+        file_idx = ep[f"videos/{vid_key}/file_index"]
+
+        if chunk_idx is None or file_idx is None:
+            return None
+
+        try:
+            chunk_idx = int(chunk_idx)
+            file_idx = int(file_idx)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid chunk/file index types: chunk_index={chunk_idx} ({type(chunk_idx)}), "
+                f"file_index={file_idx} ({type(file_idx)})"
+            ) from e
+        mask_path = self.mask_path.format(video_key=vid_key, 
+                                       chunk_index=chunk_idx, 
+                                       mask_key=mask_key,
+                                       file_index=file_idx)
+
+        return Path(mask_path)
 
     @property
     def data_path(self) -> str:
@@ -239,6 +273,11 @@ class LeRobotDatasetMetadata:
     def video_path(self) -> str | None:
         """Formattable string for the video files."""
         return self.info["video_path"]
+    
+    @property
+    def mask_path(self) -> str | None:
+        """Formattable string for the mask files."""
+        return self.info["mask_path"]
 
     @property
     def robot_type(self) -> str | None:
@@ -571,8 +610,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
-        use_dynamic_images: bool = False,
-        use_depth_maps: bool = False,
+        mask_keys: list[str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -706,6 +744,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.writer = None
         self.latest_episode = None
         self._current_file_start_frame = None  # Track the starting frame index of the current parquet file
+        
+        self.mask_keys = mask_keys if mask_keys is not None else []
 
         self.root.mkdir(exist_ok=True, parents=True)
 
@@ -743,10 +783,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # if self.delta_timestamps is not None:
         #     check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
         #     self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
-            
-        # 深度マップと動的領域画像の設定
-        self.use_dynamic_images = use_dynamic_images
-        self.use_depth_maps = use_depth_maps
 
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
@@ -1041,6 +1077,92 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     #     return item
     
+        
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def _load_raw_mask_file(mask_path: str) -> np.ndarray:
+        return np.load(mask_path, mmap_mode="r", allow_pickle=False)
+
+    @staticmethod
+    @lru_cache(maxsize=8192)
+    def _load_single_mask_as_hw_cached(mask_path: str, target_h: int, target_w: int, frame_idx: int) -> torch.Tensor:
+        m = LeRobotDataset._load_raw_mask_file(mask_path)
+
+        if m.ndim == 3:
+            if not (0 <= frame_idx < m.shape[0]):
+                raise IndexError(f"frame_idx={frame_idx} out of range T={m.shape[0]} for {mask_path}")
+            m2 = m[frame_idx]
+        elif m.ndim == 4 and m.shape[1] == 1:
+            if not (0 <= frame_idx < m.shape[0]):
+                raise IndexError(f"frame_idx={frame_idx} out of range T={m.shape[0]} for {mask_path}")
+            m2 = m[frame_idx, 0]
+        else:
+            raise ValueError(f"Unexpected mask shape: {m.shape} from {mask_path}")
+
+        # resize が必要なら
+        if m2.shape != (target_h, target_w):
+            m2 = cv2.resize(m2, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+        # ★ 安定化：memmap view を必ずコピーして torch 化（miss分しか走らないのでコスト極小）
+        m2 = np.asarray(m2, dtype=np.uint8).copy()
+        return torch.from_numpy(m2)
+
+    def _load_single_mask_as_hw(
+        self,
+        mask_path: str | Path,
+        target_h: int,
+        target_w: int,
+        frame_idx: int,
+    ) -> torch.Tensor:
+        # ここで “最速設定” を決め打ち
+        # print("final cache:", LeRobotDataset._load_single_mask_as_hw_cached.cache_info())
+        return LeRobotDataset._load_single_mask_as_hw_cached(
+            str(mask_path),
+            target_h,
+            target_w,
+            frame_idx,
+        ).to(torch.uint8)
+
+    
+    # def _load_single_mask_as_hw(
+    #     self,
+    #     mask_path: str | Path,
+    #     target_h: int,
+    #     target_w: int,
+    #     frame_idx: int,          # ★ 追加
+    # ) -> torch.Tensor:
+    #     p = str(mask_path)
+    #     if p.endswith(".npz"):
+    #         d = np.load(p, allow_pickle=True)
+    #         for k in ["out_binary_masks", "mask", "masks", "binary_masks"]:
+    #             if k in d:
+    #                 m = np.asarray(d[k])
+    #                 break
+    #         else:
+    #             raise KeyError(...)
+    #     else:
+    #         m = np.asarray(np.load(p, allow_pickle=True))
+
+    #     # --- ★ 時系列ならフレーム抽出 ---
+    #     # 例: [T,H,W], [T,N,H,W], [T] (object)
+    #     if m.ndim >= 1 and m.shape[0] > 1 and frame_idx < m.shape[0]:
+    #         m = m[frame_idx]
+
+    #     # --- ここから「1フレームのマスク」として正規化 ---
+    #     if m.ndim == 3:
+    #         m2 = (m > 0).any(axis=0).astype(np.uint8)
+    #     elif m.ndim == 2:
+    #         m2 = (m > 0).astype(np.uint8)
+    #     else:
+    #         raise ValueError(f"Unexpected mask shape after indexing: {m.shape} from {mask_path}")
+
+    #     if m2.shape != (target_h, target_w):
+    #         import cv2
+    #         m2 = cv2.resize(m2, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    #     # print(f"_load_single_mask_as_hw: loaded mask {mask_path} with shape {m2.shape}")
+
+    #     return torch.from_numpy(m2).to(torch.uint8)
+    
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         """
         指定された ep_idx について、各ビデオキー vid_key のフレームを読み込む。
@@ -1097,6 +1219,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     f"[LeRobotDataset._query_videos] No video path for "
                     f"video key={vid_key}, ep_idx={ep_idx}"
                 )
+                
+            # マスクパスの取得
+            mask_paths = {}
+            if len(self.mask_keys) > 0:
+                for mask_key in self.mask_keys:
+                    rel_path_mask = self.meta.get_mask_file_path(ep_idx, vid_key, mask_key)
+                    if rel_path_mask is None:
+                        raise AssertionError(
+                            f"[LeRobotDataset._query_videos] No mask path for "
+                            f"video key={vid_key}, ep_idx={ep_idx}"
+                        )
+                    mask_paths[mask_key] = self.root / rel_path_mask
 
             video_path = self.root / rel_path
 
@@ -1126,6 +1260,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
 
             C, H, W = frames.shape
+            
+            # --- load masks (original size) ---
+            masks_t: Dict[str, torch.Tensor] = {}
+            for mask_key, mpath in mask_paths.items():
+                query_offset = 0  # 今は 1クエリ前提
+                frame_idx = int(file_idx + query_offset)
+                m = self._load_single_mask_as_hw(
+                    mpath,
+                    target_h,
+                    target_w,
+                    frame_idx=frame_idx,
+                )
+                masks_t[mask_key] = m
+            
+            # --- resize frames & masks together to target ---
             if (H != target_h) or (W != target_w):
                 # [C, H, W] → [1, C, H, W] にしてから resize
                 frames = F.interpolate(
@@ -1134,8 +1283,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze(0)                            # [C, target_h, target_w]
+                
+            # masks も target に合わせる（nearest）
+            for mask_key, m in masks_t.items():
+                Hm, Wm = int(m.shape[0]), int(m.shape[1])
+                if (Hm != target_h) or (Wm != target_w):
+                    m_resized = F.interpolate(
+                        m[None, None, ...].float(),
+                        size=(target_h, target_w),
+                        mode="nearest",
+                    ).squeeze(0).squeeze(0).to(torch.uint8)
+                    masks_t[mask_key] = m_resized
 
-            item[vid_key] = frames
+            # --- store (入れ子) ---
+            item[vid_key] = {
+                "frames": frames,      # [C,target_h,target_w]
+                "masks": masks_t,      # {mask_key: [target_h,target_w] uint8}
+            }
 
         return item
 
@@ -1189,7 +1353,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         ep_idx = item["episode_index"].item()
 
-        # 🔴 ここで meta.episodes の範囲チェックを行う
+        # ここで meta.episodes の範囲チェックを行う
         n_episodes = len(self.meta.episodes)
         if ep_idx < 0 or ep_idx >= n_episodes:
             # SequenceLeRobotDataset 側で AssertionError をキャッチしてスキップできるようにする
@@ -1209,8 +1373,25 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
+
+            # _query_videos は {vid_key: {"frames": Tensor, "masks": {mask_key: Tensor}}} を返す
+            video_pack = self._query_videos(query_timestamps, ep_idx)
+
+            # ---- 展開して item にマージ（framesは従来通り item[cam] に置く）----
+            for vid_key, pack in video_pack.items():
+                if not isinstance(pack, dict) or "frames" not in pack:
+                    raise AssertionError(
+                        f"[LeRobotDataset.__getitem__] _query_videos returned unexpected structure "
+                        f"for vid_key={vid_key}: {type(pack)} keys={list(pack.keys()) if isinstance(pack, dict) else 'N/A'}"
+                    )
+
+                item[vid_key] = pack["frames"]  # ← 従来互換：transforms がここにかかる
+
+                masks_dict = pack.get("masks", {})
+                if masks_dict:
+                    # さらに個別Tensorにも展開しておく
+                    for mask_key, m in masks_dict.items():
+                        item[f"{vid_key}/mask/{mask_key}"] = m
 
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys

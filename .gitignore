@@ -170,6 +170,8 @@ outputs/
 checkpoints/
 create_data/
 smolvla_base/
+sam3/
+sam3_outputs/
 
 # Translations
 *.mo

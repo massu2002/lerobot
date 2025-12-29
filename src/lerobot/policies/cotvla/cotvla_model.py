@@ -217,6 +217,7 @@ class CoTVLA(nn.Module):
         action_diffusion_steps: int = 100,
         action_noise_schedule: str = "squaredcos_cap_v2",
         obs_pred: bool = True,
+        use_sam_mask_loss: bool = False,
     ):
         super().__init__()
 
@@ -228,6 +229,7 @@ class CoTVLA(nn.Module):
         self.action_dim = action_dim
         self.phase = phase
         self.obs_pred = obs_pred
+        self.use_sam_mask_loss = use_sam_mask_loss
         self.pred_num = pred_num
         assert self.phase in ["pretrain", "finetune", "evaluate"]
 
@@ -499,6 +501,30 @@ class CoTVLA(nn.Module):
         x = x.permute(0, 5, 1, 3, 2, 4).contiguous()  # [N, C, h, P, w, P]
         imgs = x.view(N, C, h * P, w * P)
         return imgs  # [N, C, H, W]
+    
+    
+    def patchify_label_ratio(self, mask_b1hw: torch.Tensor, patch_size: int, num_classes: int) -> torch.Tensor:
+        """
+        mask_b1hw: [N,1,H,W] int labels (0..num_classes-1)
+        return:    [N,num_classes,L] float ratios in [0,1]
+        """
+        assert mask_b1hw.ndim == 4 and mask_b1hw.shape[1] == 1, mask_b1hw.shape
+        N, _, H, W = mask_b1hw.shape
+        assert H % patch_size == 0 and W % patch_size == 0, (H, W, patch_size)
+
+        ph = H // patch_size
+        pw = W // patch_size
+        L = ph * pw
+
+        # [N,1,H,W] -> [N, L, patch_area]
+        x = mask_b1hw.view(N, 1, ph, patch_size, pw, patch_size)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()  # [N,ph,pw,1,ps,ps]
+        x = x.view(N, L, patch_size * patch_size)      # labels per patch
+
+        ratios = []
+        for c in range(num_classes):
+            ratios.append((x == c).float().mean(dim=-1))  # [N,L]
+        return torch.stack(ratios, dim=1)                 # [N,C,L]
 
 
     def _build_image_recon_target(
@@ -540,6 +566,7 @@ class CoTVLA(nn.Module):
         mode: str = "train",
         future_image_primary: torch.Tensor | None = None,  # [B, pred_num, C, H, W] （公式の s_{t+n} 用）
         future_image_wrist:  torch.Tensor | None = None,   # 同上
+        masks_dict: Dict[str, Any] | None = None,
     ):
         """
         CoT-VLA 仕様寄せ版 forward
@@ -889,30 +916,70 @@ class CoTVLA(nn.Module):
 
             # ---- 再構成誤差の計算（future_image_* が与えられている場合）----
             if mode in ["train", "evaluate"]:
+                
+                image_recon_error = {}
 
                 image_recon_target = self._build_image_recon_target(
                     future_image_primary,  # [B, pred_num, C, H, W]
                     future_image_wrist,    # [B, pred_num, C, H, W]
-                )  # [B, 2, pred_num, N_mask, patch_dim]
+                )  # [B, 2, pred_num, L, patch_dim]  ※N_mask/Lの呼び名はどちらでもOK
 
                 target = image_recon_target.to(image_pred.device, image_pred.dtype)
 
-                # 4) ここで 0 次元が一致する（どちらも B）ことを確認
-                assert image_pred.shape[0] == target.shape[0], \
-                    f"image_pred.shape[0]={image_pred.shape[0]}, target.shape[0]={target.shape[0]}"
+                assert image_pred.shape == target.shape, \
+                    f"shape mismatch: image_pred={image_pred.shape}, target={target.shape}"
 
-                diff = image_pred - target
+                # diff^2 をここで作って使い回す
+                diff2 = (image_pred - target) ** 2                                   # [B,2,Pn,L,patch_dim]
+                batch_mse = diff2.mean()                                             # scalar
+                image_recon_error["all_batch_mse"] = batch_mse
 
-                patch_mse = (diff ** 2).mean(dim=-1)          # [B, 2, pred_num, N_mask]
-                sample_mse = patch_mse.mean(dim=(1, 2, 3))    # [B]
-                batch_mse = sample_mse.mean()                 # scalar
+                # ---- ラベルごとの再構成誤差 ----
+                if masks_dict is not None and masks_dict != {}:
+                    # patch_dim を平均してパッチごとのMSEにする（これが patch_mse）
+                    patch_mse = diff2.mean(dim=-1)                                   # [B,2,Pn,L]
 
-                image_recon_error = {
-                    "patch_mse": patch_mse,
-                    "sample_mse": sample_mse,
-                    "batch_mse": batch_mse,
-                    "reconstructed_images": recon_imgs,  # [B, 2, pred_num, 3, H, W]
-                }
+                    # 多クラスラベルマップを取り出す
+                    # 期待: [B,Pn,1,H,W]
+                    mask_primary = masks_dict["future_observation.images.front"].to(device=image_pred.device)
+                    mask_wrist   = masks_dict["future_observation.images.wrist"].to(device=image_pred.device)
+
+                    # shape を強制的に [B,Pn,1,H,W] に寄せる（よくあるズレを吸収）
+                    # 例: [B,T,H,W] -> [B,T,1,H,W]
+                    if mask_primary.ndim == 4:
+                        mask_primary = mask_primary.unsqueeze(2)
+                    if mask_wrist.ndim == 4:
+                        mask_wrist = mask_wrist.unsqueeze(2)
+
+                    assert mask_primary.ndim == 5 and mask_primary.shape[2] == 1, f"mask_primary shape={mask_primary.shape}"
+                    assert mask_wrist.ndim   == 5 and mask_wrist.shape[2] == 1,   f"mask_wrist shape={mask_wrist.shape}"
+
+                    
+                    Bm, Pm, _, Hm, Wm = mask_primary.shape
+                    Bp, _, Pn, L = patch_mse.shape
+                    assert Bm == Bp and Pm == Pn
+                    assert Hm % self.PATCH_SIZE == 0 and Wm % self.PATCH_SIZE == 0
+
+                    # ★ ここがポイント：多数決ではなく占有率
+                    # [B*Pn,1,H,W] -> [B*Pn,C,L]
+                    C = len(masks_dict.keys()) + 1  # 例：0=bg,1=block,2=robot（必要なクラス数に合わせて）
+                    prim_rat = self.patchify_label_ratio(mask_primary.reshape(Bm * Pm, 1, Hm, Wm), self.PATCH_SIZE, C).view(Bm, Pm, C, L)
+                    wrist_rat = self.patchify_label_ratio(mask_wrist.reshape(Bm * Pm, 1, Hm, Wm), self.PATCH_SIZE, C).view(Bm, Pm, C, L)
+
+                    # [B,2,Pn,C,L]
+                    ratios = torch.stack([prim_rat, wrist_rat], dim=1)  # [B,2,Pn,C,L]
+
+                    for lab in range(C):
+                        w = ratios[:, :, :, lab, :]                      # [B,2,Pn,L] in [0,1]
+                        denom = w.sum(dim=(1,2,3))                       # [B]
+                        numer = (patch_mse * w).sum(dim=(1,2,3))         # [B]
+
+                        sample_lab_mse = torch.where(
+                            denom > 0,
+                            numer / denom,
+                            torch.zeros_like(numer),
+                        )
+                        image_recon_error[f"label_{lab}_batch_mse"] = sample_lab_mse.mean()
 
         # =========================
         # 8. Action Prediction: Diffusion ActionModel + Visual CoT 条件

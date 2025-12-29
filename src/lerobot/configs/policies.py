@@ -54,6 +54,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     """
 
     n_obs_steps: int = 1
+    drop_n_last_frames: int = 0
 
     input_features: dict[str, PolicyFeature] = field(default_factory=dict)
     output_features: dict[str, PolicyFeature] = field(default_factory=dict)
@@ -156,6 +157,32 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             visual_feats["future_observation.images.wrist"] = visual_feats["observation.images.wrist"]
 
         return visual_feats
+    
+    @property
+    def mask_features(self) -> dict[str, PolicyFeature]:
+        """
+        マスク用の特徴辞書を返す版。
+
+        前提:
+        - self.input_features の中で「マスク」を表す FeatureType を用意していること。
+        例: FeatureType.MASK
+        - マスクのキー命名は画像に合わせて
+            "observation.images.front/mask/<mask_key>"
+            "observation.images.wrist/mask/<mask_key>"
+        か、あなたの運用に合わせた prefix を使うこと。
+
+        ※ 「future_」は元のマスクキーに対して future_ を付与したキーを追加します。
+        例: "future_observation.images.front/mask/sam"
+        """
+        # 1) まず既存の MASK 特徴のみ抽出
+        mask_feats = {
+            'future_observation.images.front/mask/block', 
+            'future_observation.images.front/mask/robot', 
+            'future_observation.images.wrist/mask/block', 
+            'future_observation.images.wrist/mask/robot'
+        }
+
+        return mask_feats
 
     @property
     def action_feature(self) -> PolicyFeature | None:

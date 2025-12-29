@@ -59,15 +59,15 @@ class CoTVLAConfig(PreTrainedConfig):
     # ======================
     # 1. トレーニング関連（モデルに紐づくもの）
     # ======================
-    optimizer_lr: float = 1e-3
+    optimizer_lr: float = 1e-4
     optimizer_betas: Tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 0.05
-    optimizer_grad_clip_norm: float = 1.0
+    optimizer_weight_decay: float = 1e-4 # 0.05
+    optimizer_grad_clip_norm: float = 10  # 1.0
 
-    scheduler_warmup_steps: int = 5_000
-    scheduler_decay_steps: int = 156_000
-    scheduler_decay_lr: float = 1.5e-5
+    scheduler_warmup_steps: int = 1_000 # 5000
+    scheduler_decay_steps: int = 40_000 # 156000
+    scheduler_decay_lr: float = 2.5e-6 # 1.5e-5
 
     # ======================
     # 2. データ関連（モデルに依存するものだけ）
@@ -81,6 +81,7 @@ class CoTVLAConfig(PreTrainedConfig):
     # Visual CoT 関連
     patch_size: int = 16
     obs_pred: bool = True  # Visual CoT を使うかどうか
+    use_sam_mask_loss: bool = False  # SAMマスク領域だけ(／以外)の再構成Lossを「分けて」取得するか？
 
     # シーケンス / トークン関連
     pred_num: int = 1
@@ -111,6 +112,7 @@ class CoTVLAConfig(PreTrainedConfig):
     # ======================
     # 5. 損失関数関連
     # =====================
+    mask_keys : list[str] = field(default_factory=lambda: [])
     img_recon_loss_weight: float = 1.0
 
     def __post_init__(self):

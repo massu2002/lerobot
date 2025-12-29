@@ -802,6 +802,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
+        # print(images.shape, img_masks.shape, lang_tokens.shape, lang_masks.shape, state.shape, actions.shape)
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -1079,23 +1080,23 @@ class PI0Policy(PreTrainedPolicy):
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 5:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 5} more")
+                # if len(missing_keys) <= 5:
+                #     for key in missing_keys:
+                #         print(f"  - {key}")
+                # else:
+                #     for key in missing_keys[:5]:
+                #         print(f"  - {key}")
+                #     print(f"  ... and {len(missing_keys) - 5} more")
 
             if unexpected_keys:
                 print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 5:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 5} more")
+                # if len(unexpected_keys) <= 5:
+                #     for key in unexpected_keys:
+                #         print(f"  - {key}")
+                # else:
+                #     for key in unexpected_keys[:5]:
+                #         print(f"  - {key}")
+                #     print(f"  ... and {len(unexpected_keys) - 5} more")
 
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")

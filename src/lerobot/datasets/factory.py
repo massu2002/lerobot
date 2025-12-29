@@ -89,6 +89,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        if hasattr(cfg.policy, "mask_keys"):
+            print("mask_keys found in policy config:")
+            print(cfg.policy.mask_keys)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -98,8 +101,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
-                use_dynamic_images=cfg.use_dynamic_images,
-                use_depth_maps=cfg.use_depth_maps,
+                mask_keys=cfg.policy.mask_keys if hasattr(cfg.policy, "mask_keys") else None,
             )
         else:
             dataset = StreamingLeRobotDataset(
