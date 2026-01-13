@@ -199,3 +199,6 @@ vla_models/
 *.ckpt
 core
 core.*
+/SmolVLM2-500M-Video-Instruct/
+/smolvla_base/
+/sam3/
