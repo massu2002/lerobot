@@ -1,11 +1,18 @@
-
+# !/bin/bash
 export HF_LEROBOT_HOME="/home/masuoka/lerobot/finetune_dataset"
 
 # ファインチューニング実行設定
-optimizer_lr=4e-4
+steps=100000
+save_freq=25000
+optimizer_lr=3e-4
+scheduler_warmup_steps=$(( steps / 100 ))
+scheduler_decay_steps=$(( steps * 40 / 100 ))
+scheduler_decay_lr=$(python -c "print(float('${optimizer_lr}')/10)")
+optimizer_weight_decay=5e-4
+optimizer_grad_clip_norm=5.0
 batch_size=32
-steps=40000
-save_freq=10000
+steps=100000
+save_freq=25000
 seed=42
 
 # ファインチューニングデータセット設定
@@ -29,5 +36,4 @@ lerobot-train \
   --save_freq=${save_freq} \
   --batch_size=${batch_size} \
   --dataset.video_backend=pyav \
-  --seed=${seed} \
-  --wandb.enable=true \
+  --seed=${seed}

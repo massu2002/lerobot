@@ -19,6 +19,7 @@ import os
 import json
 import numpy as np
 import random
+from collections import Counter
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -34,7 +35,7 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import DistributedEpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env
 from lerobot.envs.utils import close_envs
@@ -60,7 +61,42 @@ from lerobot.utils.utils import (
 
 import torch
 from torch.utils.data import Dataset
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from typing import Any
+
+def extract_episode_indices(batch):
+    ep = batch.get("episode_index", None)
+    if ep is None:
+        return []
+
+    if torch.is_tensor(ep):
+        return [int(x) for x in ep.detach().cpu().view(-1).tolist()]
+
+    if isinstance(ep, (list, tuple)):
+        out = []
+        for x in ep:
+            out.append(int(x.item()) if torch.is_tensor(x) else int(x))
+        return out
+
+    return [int(ep)]
+
+def jain_fairness_index(counter, num_episodes: int) -> float:
+    counts = np.array(
+        [counter.get(i, 0) for i in range(num_episodes)],
+        dtype=np.float64,
+    )
+
+    total = counts.sum()
+    if total == 0:
+        return float("nan")
+
+    denom = num_episodes * np.sum(counts ** 2)
+    if denom == 0:
+        return float("nan")
+
+    return float((total ** 2) / denom)
 
 def simple_collate(batch: Sequence[Any]) -> Any:
     """
@@ -151,13 +187,15 @@ class SequenceLeRobotDataset(Dataset):
         # 例: base_len=100, window_size=12 → 0〜88 までの 89 通り
         self.length = max(0, self.num_transitions - self.window_size + 1)
         
-        # base_dataset 側で定義されている mask_keys を参照（例: ["sam", "hand", ...]）
-        self.mask_keys = getattr(base_dataset, "mask_keys", [])
+        # マスクキー一覧（base_dataset の meta から取得）
+        self.mask_weights = getattr(base_dataset, "mask_weights", {})
 
         # 期待するマスクのフラットキー（LeRobotDataset.__getitem__ がこれを返す想定）
         self.required_mask_keys = []
         for cam in ["observation.images.front", "observation.images.wrist"]:
-            for mk in self.mask_keys:
+            for mk in self.mask_weights.keys():
+                if mk == "background":
+                    continue
                 self.required_mask_keys.append(f"{cam}/mask/{mk}")
 
 
@@ -211,6 +249,10 @@ class SequenceLeRobotDataset(Dataset):
                     return True
 
         return False
+    
+    def _get_ep(self, frame):
+        ep = frame["episode_index"]
+        return int(ep.item()) if torch.is_tensor(ep) else int(ep)
 
     def _build_seq_sample(
         self,
@@ -222,7 +264,13 @@ class SequenceLeRobotDataset(Dataset):
         """元の __getitem__ 本体部分を切り出したヘルパ。"""
         sample0 = obs_frames[0]
         seq_sample: Dict[str, Any] = {}
-
+        
+        ep0 = self._get_ep(obs_frames[0])
+        for f in obs_frames + future_action_frames:
+            if self._get_ep(f) != ep0:
+                raise AssertionError(f"Cross-episode sequence detected at idx={idx}: ep0={ep0}")
+        seq_sample["episode_index"] = ep0
+        
         for key, v0 in sample0.items():
             # action だけは「未来フレーム」から T_action を作る
             if key == "action":
@@ -249,9 +297,11 @@ class SequenceLeRobotDataset(Dataset):
                     seq_sample[f"future_{cam_key}"] = torch.stack(imgs, dim=0)
                     
         # --- subgoal 観測マスク (future_.../mask/...) を追加 ---
-        if hasattr(self, "mask_keys") and len(self.mask_keys) > 0:
+        if hasattr(self, "mask_weights") and len(self.mask_weights) > 0:
             for cam_key in ["observation.images.front", "observation.images.wrist"]:
-                for mk in self.mask_keys:
+                for mk in self.mask_weights.keys():
+                    if mk == "background":
+                        continue
                     k = f"{cam_key}/mask/{mk}"
                     if k in future_obs_frames[0]:
                         ms = [f[k] for f in future_obs_frames]
@@ -313,9 +363,19 @@ class SequenceLeRobotDataset(Dataset):
             if bad_obs or bad_future:
                 idx = random.randrange(self.length)
                 continue
+            
+            ep0 = self._get_ep(obs_frames[0])
+            if any(self._get_ep(f) != ep0 for f in (obs_frames + future_action_frames)):
+                idx = random.randrange(self.length)
+                continue
 
             # ここまで来たら「まともなシーケンス」とみなして組み立てて返す
-            return self._build_seq_sample(idx, obs_frames, future_action_frames, future_obs_frames)
+            try:
+                return self._build_seq_sample(idx, obs_frames, future_action_frames, future_obs_frames)
+            except AssertionError:
+                # Cross-episode などは捨ててリトライ
+                idx = random.randrange(self.length)
+                continue
 
         # 何度リトライしてもダメだった場合はエラーにする
         raise RuntimeError(
@@ -360,6 +420,7 @@ def update_policy(
     accelerator: Accelerator,
     lr_scheduler=None,
     lock=None,
+    mask_weights: Dict[str, float]={},
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -415,10 +476,18 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    train_metrics.total_loss = loss.item()
+    train_metrics.action_loss = output_dict.get("action_loss", 0.0)
+    train_metrics.recon_loss = output_dict.get("recon_loss", 0.0)
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
+    
+    if mask_weights != {}:
+        for mk in mask_weights.keys():
+            v = output_dict.get(f"recon_loss/{mk}", None)
+            if v is not None:
+                train_metrics.update_metric(f"recon_loss/{mk}", float(v))
     return train_metrics, output_dict
 
 
@@ -578,51 +647,76 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         n_action_steps=n_action_steps,
     )
 
-    # create dataloader for offline training (episode-aware)
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        horizon = n_obs_steps + n_action_steps - 1
-        drop_n_last_frames = max(cfg.policy.drop_n_last_frames, horizon)
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            drop_n_last_frames=drop_n_last_frames,
-            shuffle=True,
-        )
-        print(f"Using EpisodeAwareSampler with drop_n_last_frames={drop_n_last_frames}")
-    else:
-        shuffle = True
-        sampler = None
+    is_ddp = dist.is_available() and dist.is_initialized()
 
-    dataloader = torch.utils.data.DataLoader(
+    horizon = n_obs_steps + n_action_steps - 1
+    drop_n_last_frames = max(cfg.policy.drop_n_last_frames, horizon)
+
+    sampler = DistributedEpisodeAwareSampler(
+        dataset.meta.episodes["dataset_from_index"],
+        dataset.meta.episodes["dataset_to_index"],
+        drop_n_first_frames=getattr(cfg.policy, "drop_n_first_frames", 0),
+        drop_n_last_frames=drop_n_last_frames,
+        horizon=horizon,
+        shuffle=True,
+        seed=42,
+    )
+
+    raw_dataloader = torch.utils.data.DataLoader(
         seq_dataset,
-        num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming and sampler is None,
+        num_workers=cfg.num_workers,
         sampler=sampler,
-        timeout=60,
+        shuffle=False,
+        drop_last=is_ddp,          # ★DDPはTrue推奨
         pin_memory=True,
-        drop_last=False,
+        timeout=0,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
         collate_fn=simple_collate,
     )
+    
+    steps_per_epoch = len(raw_dataloader) 
+    
+    epoch = step // steps_per_epoch
+    step_in_epoch = step % steps_per_epoch
+
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
+        policy, optimizer, raw_dataloader, lr_scheduler
     )
-    dl_iter = cycle(dataloader)
+    dl_iter = iter(dataloader)
+    
+    if len(dataloader) == 0:
+        raise RuntimeError("Empty dataloader: check drop_last/batch_size/sampler filtering.")
 
+    for _ in range(step_in_epoch):
+        try:
+            next(dl_iter)
+        except StopIteration:
+            dl_iter = iter(dataloader)  # or raise
+            next(dl_iter)
+    
     policy.train()
 
     train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
+        "action_loss": AverageMeter("act_loss", ":.3f"),
+        "recon_loss": AverageMeter("recon_loss", ":.3f"),
+        "total_loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
+    
+    if hasattr(cfg.policy, "mask_weights"):
+        if cfg.policy.mask_weights != {}:
+            for mk in cfg.policy.mask_weights.keys():
+                key = f"recon_loss/{mk}"
+                train_metrics[key] = AverageMeter(key, ":.3f")
 
     # Use effective batch size for proper epoch calculation in distributed training
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -633,22 +727,51 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics,
         initial_step=step,
         accelerator=accelerator,
+        csv_path=os.path.join(cfg.output_dir, "train_output_log.csv"),
+        csv_interval=200,
+        is_main_process=is_main_process,
+        extract_episode_indices_fn=extract_episode_indices,
+        to_csv_cell_fn=to_csv_cell,
+        jain_fairness_index_fn=jain_fairness_index,
     )
 
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
+        logging.info("len(dataloader)=%d", len(dataloader)) 
         
-    csv_path = os.path.join(cfg.output_dir, "train_output_log.csv")
-    csv_interval = 200
-
     try:
-        for _ in tqdm(range(step, cfg.steps), desc="Training steps", total=cfg.steps - step):
-            # print(f"=== Training step {step + 1} ===")
+        for global_step in tqdm(range(step, cfg.steps), desc="Training steps", total=cfg.steps - step):
+
             start_time = time.perf_counter()
-            batch = next(dl_iter)
-            # print(" Batch before preproc keys:", batch.keys())
+            
+            # このepoch内の最後で全rank同時に巻き戻す
+            if global_step != step and (global_step % steps_per_epoch) == 0:
+                epoch += 1
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+                dl_iter = iter(dataloader)
+
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
+                if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
+                    dataloader.sampler.set_epoch(step)
+
+                dl_iter = iter(dataloader)
+
+                try:
+                    batch = next(dl_iter)
+                except StopIteration:
+                    # dataloaderが空（= 1バッチも作れない）
+                    raise RuntimeError(
+                        "Dataloader is empty after reinitialization. "
+                        "Likely causes: DistributedSampler(drop_last=True) with too few samples, "
+                        "or dataset filtering produced zero valid sequences on this rank."
+                    )
+                            
+            train_tracker.on_batch(batch)
             batch = preprocessor(batch)
-            # print(" Batch keys:", batch.keys())
+
             train_tracker.dataloading_s = time.perf_counter() - start_time
 
             train_tracker, output_dict = update_policy(
@@ -659,32 +782,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 cfg.optimizer.grad_clip_norm,
                 accelerator=accelerator,
                 lr_scheduler=lr_scheduler,
+                mask_weights=cfg.policy.mask_weights if hasattr(cfg.policy, "mask_weights") else {}
             )
 
             # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
             # increment `step` here.
             step += 1
             train_tracker.step()
+            train_tracker.maybe_write_csv(step=step)
+
             is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
             is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
             is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
-            
-            is_csv_step = step % csv_interval == 0 and is_main_process
-            
-            if is_csv_step:
-                row = {k: to_csv_cell(v) for k, v in output_dict.items()}
-                row["step"] = step
-
-                write_header = not os.path.exists(csv_path)
-
-                # 列順を安定させたい場合（おすすめ）
-                fieldnames = ["step"] + sorted([k for k in row.keys() if k != "step"])
-
-                with open(csv_path, "a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                    if write_header:
-                        writer.writeheader()
-                    writer.writerow(row)
 
             if is_log_step:
                 logging.info(train_tracker)

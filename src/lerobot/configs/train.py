@@ -106,15 +106,21 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
-            raise FileExistsError(
-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
-            )
-        elif not self.output_dir:
-            now = dt.datetime.now()
-            train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
-            self.output_dir = Path("outputs/train") / train_dir
+        # if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+        #     raise FileExistsError(
+        #         f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
+        #         f"Please change your output directory so that {self.output_dir} is not overwritten."
+        #     )
+        # elif not self.output_dir:
+        #     now = dt.datetime.now()
+        #     train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
+        #     self.output_dir = Path("outputs/train") / train_dir
+        now = dt.datetime.now()
+        if self.resume:
+            self.output_dir = self.output_dir
+        else:
+            self.output_dir = Path(self.output_dir) / f"{now:%Y-%m-%d}_{now:%H-%M-%S}"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")

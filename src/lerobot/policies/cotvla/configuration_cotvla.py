@@ -14,6 +14,9 @@
 
 from dataclasses import dataclass, field
 
+import yaml
+import json
+
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
@@ -21,7 +24,7 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
 from lerobot.utils.constants import OBS_IMAGES
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 
 @PreTrainedConfig.register_subclass("cotvla")
@@ -60,14 +63,14 @@ class CoTVLAConfig(PreTrainedConfig):
     # 1. トレーニング関連（モデルに紐づくもの）
     # ======================
     optimizer_lr: float = 1e-4
-    optimizer_betas: Tuple[float, float] = (0.9, 0.95)
+    optimizer_betas: Tuple[float, float] = (0.9, 0.98)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-4 # 0.05
-    optimizer_grad_clip_norm: float = 10  # 1.0
+    optimizer_weight_decay: float = 1e-4 # default: 1e-3 pretiran: 0.05
+    optimizer_grad_clip_norm: float = 1.0  # 1.0
 
-    scheduler_warmup_steps: int = 1_000 # 5000
-    scheduler_decay_steps: int = 40_000 # 156000
-    scheduler_decay_lr: float = 2.5e-6 # 1.5e-5
+    scheduler_warmup_steps: int = 2_500 # 5000
+    scheduler_decay_steps: int = 100_000 # 156000
+    scheduler_decay_lr: float = 1.5e-5 # 1.5e-5
 
     # ======================
     # 2. データ関連（モデルに依存するものだけ）
@@ -112,7 +115,7 @@ class CoTVLAConfig(PreTrainedConfig):
     # ======================
     # 5. 損失関数関連
     # =====================
-    mask_keys : list[str] = field(default_factory=lambda: [])
+    mask_weights: Dict[str, float] = field(default_factory=dict)
     img_recon_loss_weight: float = 1.0
 
     def __post_init__(self):
@@ -124,6 +127,14 @@ class CoTVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+            
+        if isinstance(self.mask_weights, str) and self.mask_weights.strip():
+            s = self.mask_weights.strip()
+            try:
+                obj = json.loads(s)          # {"block":0.5,...} を想定
+            except Exception:
+                obj = yaml.safe_load(s)      # {block:0.5,...} も許容したい場合
+            self.mask_weights = {str(k): float(v) for k, v in obj.items()}
     
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

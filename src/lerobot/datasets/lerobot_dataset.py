@@ -22,11 +22,10 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 import cv2
-from pyparsing import Dict
 import math
 import torch.nn.functional as F
 from functools import lru_cache
-
+from typing import Dict, Tuple
 import datasets
 import numpy as np
 import packaging.version
@@ -610,7 +609,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
-        mask_keys: list[str] | None = None,
+        mask_weights: Dict[str, float] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -745,7 +744,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.latest_episode = None
         self._current_file_start_frame = None  # Track the starting frame index of the current parquet file
         
-        self.mask_keys = mask_keys if mask_keys is not None else []
+        self.mask_weights = mask_weights if mask_weights is not None else {}
 
         self.root.mkdir(exist_ok=True, parents=True)
 
@@ -1222,8 +1221,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 
             # マスクパスの取得
             mask_paths = {}
-            if len(self.mask_keys) > 0:
-                for mask_key in self.mask_keys:
+            if len(self.mask_weights) > 0:
+                for mask_key in self.mask_weights.keys():
+                    if mask_key == "background":
+                        continue  # background マスクは存在しない想定
                     rel_path_mask = self.meta.get_mask_file_path(ep_idx, vid_key, mask_key)
                     if rel_path_mask is None:
                         raise AssertionError(

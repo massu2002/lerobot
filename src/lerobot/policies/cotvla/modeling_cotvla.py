@@ -52,7 +52,8 @@ policy = cotvlaPolicy.from_pretrained("lerobot/cotvla_base")
 
 import math
 from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
+import os
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from termcolor import colored
 import torch
@@ -403,37 +404,43 @@ class CoTVLAPolicy(PreTrainedPolicy):
     # ------------------------------------------------------------------
     #  Training forward
     # ------------------------------------------------------------------
-    def forward(
-        self,
-        batch: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
-        """トレーニング時の forward（損失計算）。
+    def forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """トレーニング時の forward (損失計算)"""
 
-        戻り値:
-            loss:   backward に使うスカラー Tensor
-            loss_dict: ログ用に中間の loss テンソルをいくつか保持した dict
-        """
         if getattr(self.config, "adapt_to_pi_aloha", False):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
-            # 既存データのアクションを Aloha 互換の joint 表現に変換
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
-        if self.config.mask_keys != []:
-            masks_dict, pad_dict, mask_keys = self.prepare_masks_multiclass_dict(batch)
-        else:
-            masks_dict = {}
-            pad_dict = {}
-            mask_keys = []
+
+        # -----------------------------
+        # masks: mask_weights が dict で非空なら有効
+        # -----------------------------
+        mask_weights_cfg = getattr(self.config, "mask_weights", None)
+        has_mask_weights = isinstance(mask_weights_cfg, dict) and (len(mask_weights_cfg) > 0)
+
+        masks_dict, pad_dict, mask_keys = {}, {}, []
+        mask_num_classes = None
+
+        if has_mask_weights:
+            masks_dict, pad_dict, mask_keys, meta = self.prepare_masks_multiclass_dict(batch)
+
+            class_map = getattr(self, "mask_class_map", {}) or {}
+            max_cid = 0
+            for mk in mask_keys:
+                max_cid = max(max_cid, int(class_map.get(mk, 0)))
+            mask_num_classes = max(1, int(max_cid + 1))  # bg(0)込み
+
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_id_pad", None)
 
         loss_dict: Dict[str, Tensor] = {}
 
+        # -----------------------------
         # CoTVLA 本体の forward
+        # -----------------------------
         _, loss_arm_action, _, image_recon_error = self.model.forward(
             image_primary=images[1],
             image_wrist=images[0],
@@ -445,49 +452,49 @@ class CoTVLAPolicy(PreTrainedPolicy):
             future_image_primary=images[2] if len(images) > 2 else None,
             future_image_wrist=images[3] if len(images) > 3 else None,
             masks_dict=masks_dict if len(masks_dict) > 0 else None,
+            mask_num_classes=mask_num_classes,
         )
-        
-        # 総合損失を計算
-        if image_recon_error is not None:
-            img_recon_scalar = image_recon_error["all_batch_mse"]
-            losses = loss_arm_action + self.config.img_recon_loss_weight * img_recon_scalar
-        else:
-            losses = loss_arm_action
-            
-        if image_recon_error is not None and mask_keys is not None and len(mask_keys) > 0:
-            class_map = self.build_mask_class_map(mask_keys)  # 例: {"block":1,"robot":2,...}
 
-            # まず all を既存キーで保持
-            loss_dict["image_recon_error/all_batch_mse"] = image_recon_error.get(
-                "all_batch_mse",
-                torch.tensor(0.0, device=loss_arm_action.device),
+        if loss_arm_action is None:
+            loss_arm_action = torch.tensor(0.0, device=images[0].device)
+
+        device = loss_arm_action.device
+
+        # -----------------------------
+        # recon loss
+        # -----------------------------
+        if image_recon_error is not None:
+            class_map = getattr(self, "mask_class_map", {}) or {}
+            class_weight_by_id = getattr(self, "mask_class_weight_by_id", None)
+
+            recon_loss_weighted, recon_logs = self._aggregate_recon_loss_weighted(
+                image_recon_error=image_recon_error,
+                device=device,
+                mask_keys=mask_keys,
+                class_map=class_map,
+                mask_weights_cfg=mask_weights_cfg,
+                class_weight_by_id=class_weight_by_id,
+                include_background=True,
+                background_key="background",
+                count_missing_as_zero=False,  # 旧挙動に寄せるなら True
             )
 
-            # mask_key -> class_id -> image_recon_error["label_{id}_batch_mse"]
-            for mk, cid in class_map.items():
-                k = f"label_{cid}_batch_mse"
-                v = image_recon_error.get(k, None)
+            loss_dict.update(recon_logs)
 
-                # 無い場合（そのラベルがそのbatchに存在しない等）は 0 で埋める
-                if v is None:
-                    v = torch.tensor(0.0, device=loss_arm_action.device)
-
-                # loss_dict へ（ログしやすいキー名にする）
-                loss_dict[f"image_recon_error/{mk}_batch_mse"] = v
-                # print(f"[Visual CoT] label {mk} (class_id={cid}) recon batch_mse: {v.item():.6f}")
-            # print(f"[Visual CoT] total recon batch_mse: {loss_dict['image_recon_error/all_batch_mse'].item():.6f}")
+            losses = loss_arm_action + float(self.config.img_recon_loss_weight) * recon_loss_weighted
 
         else:
-            # image_recon_error が無い場合もキーは作っておくとログが安定する
-            loss_dict["image_recon_error/all_batch_mse"] = torch.tensor(0.0, device=loss_arm_action.device)
-        
+            loss_dict["recon_loss/all"] = torch.tensor(0.0, device=device)
+            loss_dict["recon_loss"] = torch.tensor(0.0, device=device)
+            losses = loss_arm_action
+
         # アクション予測誤差
         loss_dict["action_loss"] = loss_arm_action
 
-        # 最終的な平均化
+        # 最終的な平均化（Tensorで返す方がログが安定）
         loss = losses.mean()
-        loss_dict["loss"] = loss.item()
-        
+        loss_dict["loss"] = loss
+
         return loss, loss_dict
 
     # ------------------------------------------------------------------
@@ -602,63 +609,278 @@ class CoTVLAPolicy(PreTrainedPolicy):
         if K != 1:
             m = (m > 0).any(dim=2, keepdim=True)     # [B,T,1,H,W]
         return m, B, T, H, W
+    
+    
+    def _get_weight_for_key(
+        self,
+        *,
+        mk: str,
+        cid: int,
+        mask_weights_cfg: Optional[dict],
+        class_weight_by_id: Optional[dict],
+        default_w: float = 1.0,
+    ) -> float:
+        """
+        重みの優先順位:
+        1) class_weight_by_id[cid] (cid>0 のときのみ)
+        2) mask_weights_cfg[mk]
+        3) default_w
+        """
+        if cid > 0 and isinstance(class_weight_by_id, dict):
+            return float(class_weight_by_id.get(cid, default_w))
+        if isinstance(mask_weights_cfg, dict):
+            return float(mask_weights_cfg.get(mk, default_w))
+        return float(default_w)
 
 
-    def prepare_masks_multiclass_dict(self, batch: Dict[str, Tensor])-> Tuple[Dict[str, Tensor], Dict[str, Tensor], List[str]]:
+    def _is_rank0(self) -> bool:
+        # accelerate / torchrun のどっちでも効く簡易判定
+        print("RANK:", os.environ.get("RANK", "N/A"), "LOCAL_RANK:", os.environ.get("LOCAL_RANK", "N/A"))
+        return int(os.environ.get("RANK", "0")) == 0 and int(os.environ.get("LOCAL_RANK", "0")) == 0
+
+    def _to_float(self, x: Tensor) -> float:
+        return float(x.detach().float().mean().item())
+
+    def _aggregate_recon_loss_weighted(
+        self,
+        *,
+        image_recon_error: dict,
+        device: torch.device,
+        mask_keys: List[str],
+        class_map: dict,
+        mask_weights_cfg: Optional[dict],
+        class_weight_by_id: Optional[dict],
+        include_background: bool = True,
+        background_key: str = "background",
+        count_missing_as_zero: bool = False,
+        # --- debug ---
+        debug: bool = False,
+        step: Optional[int] = None,
+        debug_every: int = 5,
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+
+        logs: Dict[str, Tensor] = {}
+        all_mse = image_recon_error.get("all_batch_mse", None)
+        all_mse = torch.tensor(0.0, device=device) if all_mse is None else all_mse.to(device)
+        logs["recon_loss/all"] = all_mse
+
+        weighted_sum = torch.tensor(0.0, device=device)
+        wsum = 0.0
+
+        # foreground
+        for mk in mask_keys:
+            cid = int(class_map.get(mk, 0))
+            if cid <= 0:
+                continue
+
+            v = image_recon_error.get(f"label_{cid}_batch_mse", None)
+            if v is None:
+                if count_missing_as_zero:
+                    v = torch.tensor(0.0, device=device)
+                else:
+                    continue
+            else:
+                v = v.to(device)
+
+            logs[f"recon_loss/{mk}"] = v
+
+            w = self._get_weight_for_key(
+                mk=mk, cid=cid,
+                mask_weights_cfg=mask_weights_cfg,
+                class_weight_by_id=class_weight_by_id,
+                default_w=1.0,
+            )
+
+            logs[f"recon_loss_weighted/{mk}"] = v * float(w)
+            weighted_sum = weighted_sum + v * float(w)
+            wsum += float(w)
+
+        # ---- background ----
+        if include_background:
+            bg_mse = image_recon_error.get("label_0_batch_mse", None)
+            if bg_mse is not None:
+                bg_mse = bg_mse.to(device)
+            else:
+                bg_mse = torch.tensor(0.0, device=device)
+
+            logs["recon_loss/background"] = bg_mse
+
+            # bg weight（安全にfallback）
+            if isinstance(mask_weights_cfg, dict):
+                bg_w = float(mask_weights_cfg.get(background_key, 0.0))
+            else:
+                bg_w = 0.0
+
+            logs["recon_loss_weighted/background"] = bg_mse * bg_w
+            weighted_sum = weighted_sum + bg_mse * bg_w
+            wsum += bg_w
+
+        # normalize
+        recon_loss_weighted = (weighted_sum / float(wsum)) if wsum > 0.0 else all_mse
+        logs["recon_loss"] = recon_loss_weighted
+
+        # # ===== DEBUG PRINT =====
+        # do_print = debug and self._is_rank0() and (step is None or (debug_every > 0 and step % debug_every == 0))
+        # if do_print:
+        #     print("\n=== _aggregate_recon_loss_weighted DEBUG ===")
+        #     print(f"step={step} wsum={wsum:.6f}")
+        #     print(f"recon_loss/all={self._to_float(logs['recon_loss/all']):.6f}")
+        #     print(f"weighted_sum={self._to_float(weighted_sum):.6f}")
+        #     print(f"recon_loss={self._to_float(logs['recon_loss']):.6f}")
+
+        #     for mk in mask_keys:
+        #         k = f"recon_loss/{mk}"
+        #         kw = f"recon_loss_weighted/{mk}"
+        #         if k in logs:
+        #             mse = self._to_float(logs[k])
+        #             contrib = self._to_float(logs[kw]) if kw in logs else float("nan")
+        #             w_est = (contrib / mse) if abs(mse) > 1e-12 else float("nan")
+        #             print(f"  {mk:>12s}: mse={mse:.6f} w~={w_est:.6f} contrib={contrib:.6f}")
+
+        #     if "recon_loss/background" in logs:
+        #         mse = self._to_float(logs["recon_loss/background"])
+        #         contrib = self._to_float(logs["recon_loss_weighted/background"])
+        #         w_est = (contrib / mse) if abs(mse) > 1e-12 else float("nan")
+        #         print(f"  {'background':>12s}: mse={mse:.6f} w~={w_est:.6f} contrib={contrib:.6f}")
+
+        #     print("===========================================\n")
+
+        return recon_loss_weighted, logs
+
+
+    def prepare_masks_multiclass_dict(
+        self,
+        batch: Dict[str, Tensor],
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor], List[str], Dict[str, Any]]:
         """
         <mask_key> ごとに class_id を割り当て、多クラスラベルマップとして統合して返す。
-        出力は dict。
 
         返り値:
         masks_dict[cam] = [B,T,1,H',W'] int64 (0=bg, 1..K=class)
         pad_dict[cam]   = [B,T] bool
+        mask_keys       = class_id=1..K に対応する mask_key の順序リスト（bgは含めない）
+        meta            = クラス名/ID/重み等のメタ情報（cam共通）
         """
-        # 例: ["observation.images.front/mask/sam", ...]
         feat_keys = list(self.config.mask_features)
-
         if len(feat_keys) == 0:
-            return {}, {}, []
+            return {}, {}, [], {"classes": []}
 
         # cam ごとに feature keys を束ねる
-        cam_to_feats: Dict[str, list[str]] = {}
+        cam_to_feats: Dict[str, List[str]] = {}
         for k in feat_keys:
-            # cam を "observation.images.front" のように取りたい
             if "/mask/" not in k:
                 continue
-            cam = k.split("/mask/")[0]  # "observation.images.front"
-            import logging
+            cam = k.split("/mask/")[0]
             cam_to_feats.setdefault(cam, []).append(k)
 
         if len(cam_to_feats) == 0:
             raise ValueError(f"No mask feature keys with '/mask/' found: {feat_keys}")
 
-        # mask_key -> class_id（固定）
-        # self.mask_keys を持ってるならそれを使うのが一番確実
-        mask_keys = getattr(self, "mask_keys", None)
-        if mask_keys is None or len(mask_keys) == 0:
-            # feature keys から抽出して作る
-            mask_keys = sorted({self.extract_mask_key(k) for k in feat_keys})
+        # feat_keys から実際に出現しうる mask_key 集合
+        feat_mask_keys_all = sorted({self.extract_mask_key(k) for k in feat_keys})
+
+        # -----------------------------
+        # mask_weights 対応（background を特別扱い）
+        # -----------------------------
+        raw_mask_weights = getattr(self.config, "mask_weights", None)
+        bg_aliases = {"background", "bg"}
+
+        bg_weight = 1.0
+        mask_keys: List[str]
+        mask_weights: Optional[Dict[str, float]]
+
+        if isinstance(raw_mask_weights, dict) and len(raw_mask_weights) > 0:
+            ordered = [(str(k), float(v)) for k, v in raw_mask_weights.items()]
+
+            # background 重み
+            for k, w in ordered:
+                if k.lower() in bg_aliases:
+                    bg_weight = float(w)
+                    break
+            self.mask_background_weight = float(bg_weight)
+
+            # bg以外 & feat側に存在するキーだけ採用（順序はmask_weightsを尊重）
+            primary = [k for k, _ in ordered if (k.lower() not in bg_aliases) and (k in feat_mask_keys_all)]
+            rest = [k for k in feat_mask_keys_all if k not in primary]
+            mask_keys = primary + rest
+
+            tmp = {k: float(v) for k, v in ordered if k.lower() not in bg_aliases}
+            tmp = {k: tmp[k] for k in tmp.keys() if k in feat_mask_keys_all}  # featに無いものは無視
+            for k in rest:
+                tmp.setdefault(k, 1.0)  # 未指定は1.0
+            mask_weights = tmp
+        else:
+            mask_keys = feat_mask_keys_all
+            mask_weights = None
+            self.mask_background_weight = float(bg_weight)
+
+        # -----------------------------
+        # class_map を作る（bgは 0）
+        # -----------------------------
         class_map = getattr(self, "mask_class_map", None)
         if class_map is None:
-            class_map = self.build_mask_class_map(mask_keys)
+            class_map = self.build_mask_class_map(mask_keys)  # 1..K を割り当て
             self.mask_class_map = class_map
 
+        # bg alias は常に 0
+        class_map["background"] = 0
+        class_map["bg"] = 0
+
+        # class_id -> weight（bg含む）を作る
+        id_to_weight: Dict[int, float] = {0: float(bg_weight)}
+        if mask_weights is not None:
+            for mk in mask_keys:
+                cid = int(class_map.get(mk, 0))
+                if cid > 0:
+                    id_to_weight[cid] = float(mask_weights.get(mk, 1.0))
+            self.mask_class_weight_by_id = {k: v for k, v in id_to_weight.items() if k != 0}
+        else:
+            # weight未指定なら fg=1.0
+            for mk in mask_keys:
+                cid = int(class_map.get(mk, 0))
+                if cid > 0:
+                    id_to_weight[cid] = 1.0
+            self.mask_class_weight_by_id = None
+
+        # id_to_name / name_to_id を整備（bgを正規名 "background" に寄せる）
+        id_to_name: Dict[int, str] = {0: "background"}
+        for mk in mask_keys:
+            cid = int(class_map.get(mk, 0))
+            if cid > 0:
+                id_to_name[cid] = str(mk)
+
+        name_to_id: Dict[str, int] = {v: k for k, v in id_to_name.items()}
+
+        # class一覧（0..K の順）
+        max_cid = max(id_to_name.keys()) if len(id_to_name) > 0 else 0
+        classes = []
+        for cid in range(max_cid + 1):
+            nm = id_to_name.get(cid, f"unknown_{cid}")
+            wt = float(id_to_weight.get(cid, 1.0 if cid != 0 else bg_weight))
+            classes.append({"id": cid, "name": nm, "weight": wt})
+
+        meta: Dict[str, Any] = {
+            "classes": classes,                 # [{"id":0,"name":"background","weight":...}, ...]
+            "id_to_name": id_to_name,           # {0:"background", 1:"robot", ...}
+            "name_to_id": name_to_id,           # {"background":0, "robot":1, ...}
+            "id_to_weight": id_to_weight,       # {0:bg_w, 1:w1, ...}
+            "background_weight": float(bg_weight),
+        }
+
+        # -----------------------------
+        # masks_dict / pad_dict を生成
+        # -----------------------------
         masks_dict: Dict[str, Tensor] = {}
         pad_dict: Dict[str, Tensor] = {}
 
         for cam, keys in cam_to_feats.items():
-            # この cam に属する mask が1つも batch に無いならエラー（スキップにしたければここを変更）
             present = [k for k in keys if k in batch]
             if len(present) == 0:
                 raise ValueError(f"All mask features for cam '{cam}' are missing from batch. expected={keys}")
 
-            # 基準 shape を最初の present から決める
             m0, B, T, H, W = self._to_bt1hw(batch[present[0]])
-
-            # ラベルマップ初期化（0=bg）
             label = torch.zeros((B, T, 1, H, W), dtype=torch.int64, device=m0.device)
 
-            # padding mask（なければ全True）
             pad_key0 = f"{present[0]}_padding_mask"
             if pad_key0 in batch:
                 pm = batch[pad_key0].bool()
@@ -667,21 +889,24 @@ class CoTVLAPolicy(PreTrainedPolicy):
             else:
                 pm = torch.ones((B, T), dtype=torch.bool, device=m0.device)
 
-            # 各 mask_key を class_id で塗る（重なりは後勝ち）
             for k in present:
-                mk = self.extract_mask_key(k)          # "sam"
-                cid = int(class_map.get(mk, 0))   # 未登録なら0
+                mk = self.extract_mask_key(k)
+                if mk.lower() in bg_aliases:
+                    continue
+
+                cid = int(class_map.get(mk, 0))
                 if cid <= 0:
                     continue
 
                 m, B2, T2, H2, W2 = self._to_bt1hw(batch[k])
                 if (B2, T2, H2, W2) != (B, T, H, W):
-                    raise ValueError(f"Shape mismatch among masks for cam={cam}: base={(B,T,H,W)} vs {k}={(B2,T2,H2,W2)}")
+                    raise ValueError(
+                        f"Shape mismatch among masks for cam={cam}: base={(B,T,H,W)} vs {k}={(B2,T2,H2,W2)}"
+                    )
 
-                on = (m > 0)  # bool [B,T,1,H,W]
+                on = (m > 0)
                 label = torch.where(on, torch.full_like(label, cid), label)
 
-                # padding_mask が mask ごとにあるなら AND で統合したい場合（任意）
                 pk = f"{k}_padding_mask"
                 if pk in batch:
                     pm_k = batch[pk].bool()
@@ -689,18 +914,16 @@ class CoTVLAPolicy(PreTrainedPolicy):
                         pm_k = pm_k.unsqueeze(1).expand(B, T)
                     pm = pm & pm_k
 
-            # resize+pad（nearest）
             if getattr(self.config, "resize_imgs_with_padding", None) is not None:
                 rh, rw = self.config.resize_imgs_with_padding
-                label_flat = label.reshape(B * T, 1, H, W).float()  # interpolateのため float
-                label_flat = resize_with_pad_mask(label_flat, rw, rh)  # nearest+pad0 のやつ
+                label_flat = label.reshape(B * T, 1, H, W).float()
+                label_flat = resize_with_pad_mask(label_flat, rw, rh)
                 label = label_flat.reshape(B, T, 1, rh, rw).to(torch.int64)
 
-            masks_dict[cam] = label      # camごとの多クラス
+            masks_dict[cam] = label
             pad_dict[cam] = pm
-            # print(f"[Visual CoT] prepared mask for cam '{cam}': classes={keys}, shape={label.shape}, pad_shape={pm.shape}")
 
-        return masks_dict, pad_dict, mask_keys
+        return masks_dict, pad_dict, mask_keys, meta
 
     def prepare_state(self, batch: Dict[str, Tensor]) -> Tensor:
         """ロボット状態ベクトルをパディングして固定長に揃える。"""
